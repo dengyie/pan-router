@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -317,7 +318,41 @@ func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, er
 			r.accounts.MarkCooldown(acc.ID, 5*time.Minute)
 		}
 	}
+	// 被包装的上游原因(连接超时、TLS 握手失败、连接被复位、非 JSON 负载)只有
+	// de.Err 里才有真因;不记的话线上只剩「网络请求失败」这类统一文案,排障时
+	// 无从区分「隧道断了」与「上游 5xx」——2026-11-17 mangodrive 三次 502 就是
+	// 这样瞎掉的。只记有原因的那部分(纯业务码错误 de.Err 为 nil,不刷日志)。
+	if de.Err != nil {
+		r.log.Warnw("driver error",
+			"pan", pan, "kind", de.Kind, "hint", de.UserHint, "cause", logCause(de.Err))
+	}
 	return err
+}
+
+// logCauseLimit 是落日志的上游原因长度上限:够看清错误类型与目标地址,又不至于
+// 让异常响应体把一行日志撑爆。
+const logCauseLimit = 300
+
+// logCauseRe 抹掉凭据类字段(api_token/Cookie 严禁入日志)。
+//
+// 值部分吃到行尾/引号/`&` 为止,而不是 ``[^&\s]*``:凭据有两种形态——查询串
+// `?token=xxx&a=1` 与请求头 `Authorization: Bearer xxx` / `Cookie: a=b; c=d`,
+// 后者带空格,按空白截断只会把 "Bearer" 抹掉、把真正的令牌留在日志里。
+// 宁可多抹(整行尾部)也不能漏。
+var logCauseRe = regexp.MustCompile(
+	`(?i)(bduss(?:_bfess)?|stoken|ptoken|baiduid|bdclnd|access_token|token|cookie|authorization)=[^&\r\n"']*`)
+
+// logCause 把被包装的上游原因整理成一行:先截断再抹凭据,顺序与 baidu.snippet
+// 一致(先限长,避免对超长错误串跑正则)。按 rune 截断,不切碎多字节字符。
+func logCause(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if r := []rune(s); len(r) > logCauseLimit {
+		s = string(r[:logCauseLimit]) + "…"
+	}
+	return logCauseRe.ReplaceAllString(s, "$1=***")
 }
 
 type resolverCtxKey int
