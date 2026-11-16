@@ -293,7 +293,24 @@ func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, er
 		} else if !canPick(ctx) {
 			de.UserHint = "该网盘需要登录后才能提链,请先登录;" + de.UserHint
 		} else {
-			de.UserHint = "该网盘需要登录态,请先在「账号管理」添加账号;" + de.UserHint
+			// 「没有可用账号」有三种原因,提示必须对得上:没配账号 / 账号在冷却 /
+			// 账号全部过期封禁。生产实证(2026-11-17,百度 9013):第 1 个文件
+			// 如实报「转存被限制」后账号进入 5min 冷却,第 2 个文件却提示
+			// 「请先在账号管理添加账号」——用户会去账号页找一个明明存在的账号。
+			total, cooling, nextReady := r.accounts.PoolState(pan)
+			switch {
+			case cooling > 0:
+				wait := time.Until(nextReady)
+				if wait < time.Second {
+					wait = time.Second
+				}
+				de.UserHint = fmt.Sprintf("该网盘账号正在冷却(触发风控后自动降温),约 %d 秒后可再试;%s",
+					int(wait.Seconds()+0.5), de.UserHint)
+			case total > 0:
+				de.UserHint = "该网盘账号不可用(已过期/封禁),请到「账号管理」更新;" + de.UserHint
+			default:
+				de.UserHint = "该网盘需要登录态,请先在「账号管理」添加账号;" + de.UserHint
+			}
 		}
 	case driver.KindRiskControl:
 		if acc != nil {
@@ -555,10 +572,28 @@ func (r *Resolver) localPaceInterval(pan string) time.Duration {
 	return d
 }
 
+// fillUnlinked 给「因停链而未尝试」的文件补上原因。
+//
+// ★ 旧实现留下 download_url 与 link_error 双空的行:前端看起来像「这文件没
+// 问题,只是暂时没链接」,用户无从判断是账号/预算问题。生产实证(2026-11-17,
+// 百度 9 文件分享):只有 2 个有错误文案,其余 7 个双空,原因只在全局 hint 里。
+// 只填空行,不覆盖已尝试过的结果。
+func fillUnlinked(items []FileItem, pending []int, msg string) {
+	if msg == "" {
+		return
+	}
+	for _, idx := range pending {
+		if items[idx].DownloadURL == "" && items[idx].LinkError == "" {
+			items[idx].LinkError = msg
+		}
+	}
+}
+
 // autoLinkSerial 逐个自动提链(基线语义):鉴权失败立即停、预算不足停、
-// 结果按原顺序回填。返回成功链接数/鉴权阻断/预算停止/提示。
+// 顺序回填;停链时给未尝试的文件补上停链原因。
 func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes []driver.FileNode,
 	items []FileItem, pending []int, clientUA, pan string) (linked int, authBlocked, budgetStop bool, hint string) {
+	var stopMsg string
 	for _, idx := range pending {
 		if authBlocked {
 			break
@@ -567,6 +602,7 @@ func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes
 		if !canAutoLink(ctx) {
 			budgetStop = true
 			hint = joinHints(hint, "请求剩余时间不足,未继续自动提链")
+			stopMsg = "请求剩余时间不足,未继续自动提链"
 			r.log.Warnw("auto-link skipped: deadline", "pan", pan, "fid", fid)
 			break
 		}
@@ -580,6 +616,7 @@ func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes
 				if de.Kind == driver.KindAuthExpired {
 					authBlocked = true
 					hint = joinHints(hint, de.UserHint)
+					stopMsg = de.UserHint
 				}
 			} else {
 				items[idx].LinkError = lerr.Error()
@@ -587,6 +624,9 @@ func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes
 			if errors.Is(lerr, context.DeadlineExceeded) || errors.Is(lerr, context.Canceled) {
 				budgetStop = true
 				hint = joinHints(hint, "请求已超时或取消,未继续自动提链")
+				if stopMsg == "" {
+					stopMsg = "请求已超时或取消,未继续自动提链"
+				}
 			}
 			r.log.Warnw("auto-link failed", "pan", pan, "fid", fid, "kind", kind, "hint", items[idx].LinkError)
 		} else {
@@ -595,6 +635,7 @@ func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes
 			linked++
 		}
 	}
+	fillUnlinked(items, pending, stopMsg)
 	return
 }
 
@@ -612,7 +653,8 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 	var (
 		mu          sync.Mutex
 		stop        bool
-		stoppedByUs bool // 主动 cancel 后,在途任务返回的 context 错误不算失败
+		stoppedByUs bool   // 主动 cancel 后,在途任务返回的 context 错误不算失败
+		stopMsg     string // 停链原因:给未尝试的文件补 link_error
 	)
 	stopAll := func() {
 		mu.Lock()
@@ -645,6 +687,7 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 					if !stop {
 						stop, budgetStop = true, true
 						hint = joinHints(hint, "请求剩余时间不足,未继续自动提链")
+						stopMsg = "请求剩余时间不足,未继续自动提链"
 					}
 					mu.Unlock()
 					continue
@@ -680,10 +723,14 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 				if authFail {
 					authBlocked = true
 					hint = joinHints(hint, de.UserHint)
+					stopMsg = de.UserHint
 				}
 				if errors.Is(lerr, context.DeadlineExceeded) || errors.Is(lerr, context.Canceled) {
 					budgetStop = true
 					hint = joinHints(hint, "请求已超时或取消,未继续自动提链")
+					if stopMsg == "" {
+						stopMsg = "请求已超时或取消,未继续自动提链"
+					}
 				}
 				mu.Unlock()
 				r.log.Warnw("auto-link failed", "pan", pan, "fid", nodes[idx].FID, "kind", kind, "hint", hintText)
@@ -694,6 +741,7 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 		}()
 	}
 	wg.Wait()
+	fillUnlinked(items, pending, stopMsg)
 	return
 }
 

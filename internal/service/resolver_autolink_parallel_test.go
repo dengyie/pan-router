@@ -134,8 +134,11 @@ func TestAutoLinkParallelAuthStops(t *testing.T) {
 		t.Fatalf("hint=%q 应带上 driver 提示", res.Hint)
 	}
 	for i := 1; i < len(res.Files); i++ {
-		if res.Files[i].LinkError != "" || res.Files[i].DownloadURL != "" {
-			t.Fatalf("停链后第 %d 个文件应保持未提链: %+v", i, res.Files[i])
+		if res.Files[i].DownloadURL != "" {
+			t.Fatalf("停链后第 %d 个文件不应有直链: %+v", i, res.Files[i])
+		}
+		if res.Files[i].LinkError == "" {
+			t.Fatalf("停链后第 %d 个文件必须补上停链原因(不得双空): %+v", i, res.Files[i])
 		}
 	}
 	if _, calls := d.stats(); calls > 3 {

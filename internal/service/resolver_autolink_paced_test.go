@@ -149,3 +149,113 @@ func TestAsLocalThrottle(t *testing.T) {
 		t.Fatal("errLocalThrottle 必须可 Unwrap")
 	}
 }
+
+// PoolState 只把「冷却未到期」算作冷却;到期/过期/正常都不算。
+func TestPoolStateCountsCoolingOnly(t *testing.T) {
+	resolver, store := newTestResolver(t, &twoFileDriver{},
+		config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	seedCookieAccount(t, store)
+	accs, err := store.ListAccounts("fake")
+	if err != nil || len(accs) != 1 {
+		t.Fatalf("seed account: %v %d", err, len(accs))
+	}
+	if total, cooling, _ := resolver.accounts.PoolState("fake"); total != 1 || cooling != 0 {
+		t.Fatalf("正常账号不应算冷却: total=%d cooling=%d", total, cooling)
+	}
+	until := time.Now().Add(2 * time.Minute)
+	if err := store.MarkAccountCooldown(accs[0].ID, until); err != nil {
+		t.Fatal(err)
+	}
+	total, cooling, ready := resolver.accounts.PoolState("fake")
+	if total != 1 || cooling != 1 {
+		t.Fatalf("冷却中账号应被统计: total=%d cooling=%d", total, cooling)
+	}
+	if ready.IsZero() || time.Until(ready) > 2*time.Minute+time.Second {
+		t.Fatalf("nextReady=%v 应接近 2 分钟后", ready)
+	}
+	// 冷却已到期:Pick 会复位,不算冷却。
+	if err := store.MarkAccountCooldown(accs[0].ID, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, cooling, _ := resolver.accounts.PoolState("fake"); cooling != 0 {
+		t.Fatalf("到期冷却不应再统计, cooling=%d", cooling)
+	}
+}
+
+// 「没有可用账号」的提示必须区分三态:没配账号 / 账号冷却中 / 账号全部过期。
+// 生产实证(2026-11-17,百度 9013):风控把唯一账号打进冷却后,后续文件被
+// 提示「请先在账号管理添加账号」——账号明明存在。
+func TestAuthHintDistinguishesCooling(t *testing.T) {
+	hintOf := func(t *testing.T, resolver *Resolver) string {
+		t.Helper()
+		err := resolver.mapErr(WithAuthed(context.Background(), true), "fake", nil,
+			driver.NewErr(driver.KindAuthExpired, "上游要求登录态", nil))
+		var de *driver.Error
+		if !errors.As(err, &de) {
+			t.Fatalf("want driver.Error, got %v", err)
+		}
+		return de.UserHint
+	}
+
+	// 没配账号。
+	r1, _ := newTestResolver(t, &twoFileDriver{}, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	if h := hintOf(t, r1); !strings.Contains(h, "添加账号") {
+		t.Fatalf("无账号时应提示添加账号, got %q", h)
+	}
+
+	// 账号冷却中:不得说「添加账号」,要给冷却与等待时间。
+	r2, store2 := newTestResolver(t, &twoFileDriver{}, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	seedCookieAccount(t, store2)
+	accs, _ := store2.ListAccounts("fake")
+	if err := store2.MarkAccountCooldown(accs[0].ID, time.Now().Add(90*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	h := hintOf(t, r2)
+	if !strings.Contains(h, "冷却") || strings.Contains(h, "添加账号") {
+		t.Fatalf("冷却中应提示冷却而不是添加账号, got %q", h)
+	}
+	if !strings.Contains(h, "秒后可再试") {
+		t.Fatalf("冷却提示应带上等待时间, got %q", h)
+	}
+
+	// 账号全部过期:提示更新,而不是「添加」。
+	r3, store3 := newTestResolver(t, &twoFileDriver{}, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	seedCookieAccount(t, store3)
+	accs3, _ := store3.ListAccounts("fake")
+	if err := store3.MarkAccountStatus(accs3[0].ID, "expired"); err != nil {
+		t.Fatal(err)
+	}
+	if h := hintOf(t, r3); !strings.Contains(h, "过期") || strings.Contains(h, "添加账号") {
+		t.Fatalf("过期账号应提示更新, got %q", h)
+	}
+}
+
+// 账号冷却期间的整批解析:列表仍成功(匿名可列),每个文件都带上冷却原因,
+// 不得出现 download_url/link_error 双空。
+func TestResolveShareCoolingAccountExplainsEveryFile(t *testing.T) {
+	d := &twoFileDriver{fn: func(context.Context, string) (driver.DirectLink, error) {
+		return driver.DirectLink{}, driver.NewErr(driver.KindAuthExpired, "百度提链需要登录态", nil)
+	}}
+	resolver, store := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	seedCookieAccount(t, store)
+	accs, _ := store.ListAccounts("fake")
+	if err := store.MarkAccountCooldown(accs[0].ID, time.Now().Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := resolver.ResolveShare(WithAuthed(context.Background(), true), testShareURL, "", "")
+	if err != nil {
+		t.Fatalf("账号冷却不应让列表失败: %v", err)
+	}
+	if !strings.Contains(res.Hint, "冷却") {
+		t.Fatalf("hint 应说明账号在冷却, got %q", res.Hint)
+	}
+	for i, f := range res.Files {
+		if f.DownloadURL != "" {
+			t.Fatalf("冷却期不应有直链: %+v", f)
+		}
+		if !strings.Contains(f.LinkError, "冷却") {
+			t.Fatalf("第 %d 个文件应说明冷却原因, got %q", i, f.LinkError)
+		}
+	}
+}

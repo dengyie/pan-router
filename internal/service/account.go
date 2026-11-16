@@ -212,10 +212,41 @@ func (s *AccountService) checkAcc(ctx context.Context, acc *repo.Account, drv dr
 	return v.(driver.CredStatus), nil
 }
 
+// PoolState 汇总该 pan 的账号池状态,供「Pick 选不出账号」时区分原因。
+//
+// ★ 旧行为把「没有账号」和「账号都在冷却」混成一个 nil:解析链路的 mapErr
+// 只能猜成「请先添加账号」,而真实情况是刚才一次风控把唯一的账号送进了 5 分钟
+// 冷却。生产实证(2026-11-17,百度 9013):9 文件分享里第 1 个如实报「转存被
+// 限制」,第 2 个却报「该网盘需要登录态,请先添加账号」——账号明明在库里。
+// total=0 才是真的没配账号;cooling>0 且 Pick 选不出,说明全池都在降温。
+func (s *AccountService) PoolState(pan string) (total, cooling int, nextReady time.Time) {
+	list, err := s.store.ListAccounts(pan)
+	if err != nil {
+		return 0, 0, time.Time{}
+	}
+	now := time.Now()
+	for i := range list {
+		total++
+		if list[i].Status != "cooling" || list[i].CooldownUntil == nil {
+			continue
+		}
+		if !list[i].CooldownUntil.After(now) {
+			// 冷却已到期:Pick 会选中并复位,不算「正在冷却」。
+			continue
+		}
+		cooling++
+		if nextReady.IsZero() || list[i].CooldownUntil.Before(nextReady) {
+			nextReady = *list[i].CooldownUntil
+		}
+	}
+	return total, cooling, nextReady
+}
+
 // MarkStatus 供 resolver 在 AuthExpired 时标记账号失效。
 // ★ 只写 status 列,不做「读整行 → 改内存 → 写回整行」:整行回写会拿一次
-//   可能已过期的快照把 cooldown_until / cred_version 等并发改动一起冲掉
-//   (如 MarkStatus 与 MarkCooldown 并发时,后写者用旧值复活冷却/凭据代际)。
+//
+//	可能已过期的快照把 cooldown_until / cred_version 等并发改动一起冲掉
+//	(如 MarkStatus 与 MarkCooldown 并发时,后写者用旧值复活冷却/凭据代际)。
 func (s *AccountService) MarkStatus(accID uint, status string) {
 	_ = s.store.MarkAccountStatus(accID, status)
 	s.RefreshStatusMetrics()

@@ -69,8 +69,8 @@ func TestResolveShareAuthExpiredStops(t *testing.T) {
 	if res.Files[0].DownloadURL != "" {
 		t.Fatalf("AuthExpired 不应给出 download_url")
 	}
-	if res.Files[1].LinkError != "" || res.Files[1].DownloadURL != "" {
-		t.Fatalf("停后续提链后第二文件应保持未提链: %+v", res.Files[1])
+	if res.Files[1].LinkError == "" || res.Files[1].DownloadURL != "" {
+		t.Fatalf("停链后未尝试的文件必须补上原因(不得 download_url/link_error 双空): %+v", res.Files[1])
 	}
 	if got := d.calls.Load(); got != 1 {
 		t.Fatalf("AuthExpired 后应只调一次 GetDirectLink, 实际 %d", got)

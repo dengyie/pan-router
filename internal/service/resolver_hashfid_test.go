@@ -2,9 +2,9 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -144,9 +144,9 @@ func TestResolveFilePathFidSkipsHistoryLookup(t *testing.T) {
 // 事实源,配额或 auto-link 循环被改动时必须保持这三条行为。
 type quotaFidDriver struct {
 	fakeDriver
-	dirSuffix string             // 目录 URL 以此结尾才可见
-	files     map[string]string  // fid(哈希) → 真实存储路径
-	names     []string           // 列表返回顺序(即 auto-link 顺序)
+	dirSuffix string            // 目录 URL 以此结尾才可见
+	files     map[string]string // fid(哈希) → 真实存储路径
+	names     []string          // 列表返回顺序(即 auto-link 顺序)
 }
 
 func newQuotaFidDriver(dirSuffix string, n int) *quotaFidDriver {

@@ -12,8 +12,8 @@ package service
 import (
 	"context"
 	"net/http"
-	"net/url"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -204,8 +204,8 @@ func TestTransferStreamEmptyBodyFails(t *testing.T) {
 // offline:源大小未知(expect<=0)且产物是合法的 0 字节文件 → done,不得超窗误报 failed。
 func TestOfflineConfirmZeroByteArtifact(t *testing.T) {
 	s := newOfflineStack(t)
-	s.headLen = false                 // 源大小未知(chunked)→ expect<=0
-	atomic.StoreInt64(&s.size, 0)     // 落池产物本身 0 字节(合法)
+	s.headLen = false                  // 源大小未知(chunked)→ expect<=0
+	atomic.StoreInt64(&s.size, 0)      // 落池产物本身 0 字节(合法)
 	s.setMtime("2030-01-01T00:00:00Z") // 新鲜
 
 	tr, _ := newTransferFixtureMut(t, s.up.URL, s.ol.URL, func(c *config.Config) {
@@ -225,7 +225,7 @@ func TestOfflineConfirmZeroByteArtifact(t *testing.T) {
 // 对照:expect>0 时产物大小不足仍不得确认(不放宽既有严格判据)。
 func TestOfflineConfirmStillRequiresSize(t *testing.T) {
 	s := newOfflineStack(t)
-	s.headLen = true               // 源大小已知 300 → expect=300
+	s.headLen = true                // 源大小已知 300 → expect=300
 	atomic.StoreInt64(&s.size, 100) // 落池产物只有 100 字节
 
 	tr, _ := newTransferFixtureMut(t, s.up.URL, s.ol.URL, func(c *config.Config) {
