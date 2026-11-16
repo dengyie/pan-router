@@ -538,6 +538,55 @@ func TestSweepCopiesKeepsLedgerOnDeleteFailure(t *testing.T) {
 	}
 }
 
+// 删除被风控/安全验证拦下(errno=132)时,按普通周期重试只是反复喂风控:下一次
+// 清扫必须显著推后,而不是 10 分钟后又拿同一批路径去戳一次。
+func TestSweepRiskControlBacksOff(t *testing.T) {
+	oldMtime := time.Now().Add(-2 * copyTTL).Unix()
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/rest/2.0/xpan/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{
+				{"path": "/panrouter_tmp/old.bin", "server_mtime": oldMtime},
+			}})
+		case "/share/transfer":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
+				{"to_fs_id": "999", "to": "/panrouter_tmp/new.bin"},
+			}}})
+		case "/rest/2.0/pcs/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "urls": []map[string]any{
+				{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0},
+			}})
+		case "/api/filemanager":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 132, "authwidget": map[string]any{"safetpl": "filemanager"}})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	d.rememberCopy(cred().Cookie, "OLD", "1", copyEntry{
+		fsid: "888", path: "/panrouter_tmp/old.bin", at: time.Now().Add(-2 * copyTTL),
+	})
+	if _, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+		FID: "111", Ext: map[string]string{"share_id": "12345", "uk": "67890"},
+	}); err != nil {
+		t.Fatalf("GetDirectLink: %v", err)
+	}
+	d.waitSweep()
+	d.copyMu.Lock()
+	next := d.sweepAt[fingerprint(cred().Cookie)]
+	d.copyMu.Unlock()
+	if time.Until(next) < 30*time.Minute {
+		t.Fatalf("风控拦截后应显著推后下次清扫, next=%v", time.Until(next))
+	}
+	if !d.ledgerHas(cred().Cookie, "OLD", "1") {
+		t.Fatal("风控拦截不得丢台账")
+	}
+}
+
 // 同一账号的清扫按 copySweepInterval 节流:连续提链不该每次都发删除请求。
 func TestSweepCopiesThrottled(t *testing.T) {
 	var deletes int

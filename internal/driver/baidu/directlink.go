@@ -468,6 +468,12 @@ func (d *Driver) dropCopies(items []sweepItem) {
 	d.copyMu.Unlock()
 }
 
+// isRiskControl 判断错误是否为上游风控/安全验证拒绝(重试无意义,应退避)。
+func isRiskControl(err error) bool {
+	var de *driver.Error
+	return errors.As(err, &de) && de.Kind == driver.KindRiskControl
+}
+
 // copyGone 判断复用失败是否属于「副本确实不在了」。只有这种失败才值得丢台账
 // 重新转存;网络抖动/风控/接口异常都保留台账,下次继续尝试复用。
 func copyGone(err error) bool {
@@ -614,6 +620,14 @@ func (d *Driver) sweepCopies(ctx context.Context, cred *driver.Credential, dir s
 		if derr := d.deletePaths(cleanCtx, cred.Cookie, token, paths); derr != nil {
 			// 删除失败:只丢超上限的台账(保证内存有界),其余留着下次重试。
 			d.dropCopies(forced)
+			// 风控/安全验证类失败(errno=132,authwidget.safetpl)重试没有意义,
+			// 按普通周期再戳一次只是拿同一个请求反复喂风控。把下次清扫推后:
+			// 既省调用,也避免因「持续异常流量」加深账号的风险画像。
+			if isRiskControl(derr) {
+				d.copyMu.Lock()
+				d.sweepAt[fp] = time.Now().Add(copySweepInterval * 5)
+				d.copyMu.Unlock()
+			}
 			return
 		}
 		d.dropCopies(append(forced, idle...))
