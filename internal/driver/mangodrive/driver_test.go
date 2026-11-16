@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -409,10 +410,11 @@ func TestListStopsWhenTotalReached(t *testing.T) {
 // upstream_error,隧道恢复后同一请求 0.12~0.28s 成功——根节点单发会把整次
 // 解析打死,所以补这层与 listTree 子树一致的兜底。
 func TestGetRetriesTransientFailureOnce(t *testing.T) {
-	var calls int
+	// 计数用 atomic:handler 跑在 httptest 的连接 goroutine 里,与测试主 goroutine
+	// 之间没有 happens-before,裸 int 在 -race 下必报数据竞争。
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		if calls == 1 {
+		if calls.Add(1) == 1 {
 			if hj, ok := w.(http.Hijacker); ok {
 				if conn, _, err := hj.Hijack(); err == nil {
 					_ = conn.Close()
@@ -434,17 +436,17 @@ func TestGetRetriesTransientFailureOnce(t *testing.T) {
 	if obj.Name != "a.mkv" || obj.IsDir {
 		t.Fatalf("unexpected obj: %+v", obj)
 	}
-	if calls != 2 {
-		t.Fatalf("应恰好重试一次(calls=2), got %d", calls)
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("应恰好重试一次(calls=2), got %d", n)
 	}
 }
 
 // TestGetDoesNotRetryPermanentError 锁住「只有可重试类别才重试」:
 // 路径不存在/鉴权失效是确定性结果,重试只会白花一次上游调用。
 func TestGetDoesNotRetryPermanentError(t *testing.T) {
-	var calls int
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		_, _ = w.Write([]byte(`{"code":500,"message":"object not found","data":null}`))
 	}))
 	defer srv.Close()
@@ -455,23 +457,30 @@ func TestGetDoesNotRetryPermanentError(t *testing.T) {
 	if !errors.As(err, &de) || de.Kind != driver.KindNotFound {
 		t.Fatalf("want not_found, got %v", err)
 	}
-	if calls != 1 {
-		t.Fatalf("确定性错误不应重试, calls=%d", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("确定性错误不应重试, calls=%d", n)
 	}
 }
 
 // TestGetNoRetryWhenContextExhausted:ctx 已没有预算时不再重试,避免把
 // 一次超时翻成两次、把 90s 的 resolve 预算烧光。
 func TestGetNoRetryWhenContextExhausted(t *testing.T) {
-	var calls int
+	var calls atomic.Int32
 	// 用显式 release,不依赖 <-r.Context().Done():httptest.Server.Close 会等
 	// 处理函数返回,而「ctx 到期断开连接」与 handler 侧感知未必同一刻,挂住会让
 	// Close 空等(本地实测 601s 才结束)。defer 是 LIFO:close(release) 先于
 	// srv.Close() 执行,handler 得以返回。
 	release := make(chan struct{})
+	// started 让断言与 handler 的写入有明确的同步点:Get 返回只说明 ctx 到期,
+	// 不保证 handler 已经跑起来,直接读计数既会数据竞争也可能读到 0。
+	started := make(chan struct{}, 4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		<-release // 挂住直到客户端取消
+		calls.Add(1)
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release // 挂住直到测试收尾
 	}))
 	defer srv.Close()
 	defer close(release)
@@ -482,7 +491,12 @@ func TestGetNoRetryWhenContextExhausted(t *testing.T) {
 	if _, err := api.Get(ctx, "/Pool/a.mkv"); err == nil {
 		t.Fatal("want error")
 	}
-	if calls != 1 {
-		t.Fatalf("ctx 已取消不应重试, calls=%d", calls)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("请求未到达服务端,断言前提不成立")
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("ctx 已取消不应重试, calls=%d", n)
 	}
 }
