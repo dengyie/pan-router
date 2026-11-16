@@ -129,8 +129,16 @@ func classifyErrno(errno int, msg string) *driver.Error {
 		return driver.NewErr(driver.KindAuthExpired, "百度 Cookie 已失效,请到账号页更新", nil)
 	case -9:
 		return driver.NewErr(driver.KindNotFound, "百度文件不存在或已删除", nil)
+	case 200025:
+		// 生产实证(2026-11-17):转存阶段 sekey(randsk)与百度记录不一致时返回
+		// errno=200025、show_msg「提取码输入错误,请重试」,errmsg 为空。
+		// 归为提取码问题——用户能据此核对链接与提取码,而不是看到含糊的接口异常。
+		if msg == "" {
+			msg = "提取码输入错误,请重试"
+		}
+		return driver.NewErr(driver.KindNotFound, "百度提取码校验未通过:"+msg, nil)
 	case 2:
-		// 参数错误:分享场景下多为「缺少 BDCLND / 链接无效」。
+		// 参数错误:分享场景下多为「sekey 缺失/链接无效/转存路径不存在」。
 		if strings.Contains(msg, "提取码") || strings.Contains(msg, "密码") {
 			return driver.NewErr(driver.KindNotFound, "提取码错误或分享需要提取码", nil)
 		}

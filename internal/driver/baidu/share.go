@@ -103,7 +103,30 @@ func (d *Driver) verify(ctx context.Context, surl, pwd string, cred *driver.Cred
 	if out.Randsk == "" {
 		return "", driver.NewErr(driver.KindInterfaceChanged, "百度提取码校验响应缺少 randsk", nil)
 	}
-	return out.Randsk, nil
+	return normalizeSekey(out.Randsk), nil
+}
+
+// normalizeSekey 把 sekey 归一化成**解码形态**(百度 randsk 的 URL 编码形态 → 原值)。
+//
+// 生产实证(2026-11-17,同一账号同一分享,只改编码形态,其余参数完全一致):
+//
+//	query 用编码形态 → errno=200025 show_msg「提取码输入错误,请重试」
+//	query 用解码形态 → errno=0(转存成功)
+//
+// 根因:randsk 本身已是 URL 编码形态(结尾 "%3D" 代表 base64 填充 "="),
+// /share/transfer、xpan/share 的 sekey 查询参数由 net/url 再编码一次 →
+// 双重编码,百度解一层后拿到字面量 "%3D",自然判提取码错误。
+//
+// 幂等:已解码值(标准 base64 字母表,不含 "%")原样返回,因此对存量快照里
+// 存的编码形态也安全(在读取处调用即可自愈)。
+func normalizeSekey(sekey string) string {
+	if !strings.Contains(sekey, "%") {
+		return sekey
+	}
+	if dec, err := url.QueryUnescape(sekey); err == nil && dec != sekey {
+		return dec
+	}
+	return sekey
 }
 
 // ---- 目录遍历 ----

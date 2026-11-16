@@ -72,6 +72,8 @@ func TestClassifyErrno(t *testing.T) {
 		{31066, "", driver.KindRiskControl},
 		{31061, "", driver.KindConflict},
 		{111, "", driver.KindUpstream},
+		{200025, "", driver.KindNotFound},
+		{200025, "提取码输入错误,请重试", driver.KindNotFound},
 		{42, "请稍后重试", driver.KindRiskControl},
 		{42, "分享已取消", driver.KindShareGone},
 		{42, "unexpected", driver.KindUpstream},
@@ -99,8 +101,10 @@ func TestResolveShareWalksAndCarriesContext(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "randsk": "%2Bsekey%3D"})
 		case "/rest/2.0/xpan/share":
 			q := r.URL.Query()
-			if q.Get("sekey") != "%2Bsekey%3D" {
-				t.Errorf("sekey not propagated: %q", q.Get("sekey"))
+			// randsk 是 URL 编码形态,进查询参数前必须归一化成解码形态:
+			// 否则 net/url 再编码一次 → 双重编码 → 百度判「提取码错误」(200025)。
+			if q.Get("sekey") != "+sekey=" {
+				t.Errorf("sekey must be normalized (decoded) once: %q", q.Get("sekey"))
 			}
 			if q.Get("root") == "1" {
 				sawRoot = true
@@ -115,7 +119,7 @@ func TestResolveShareWalksAndCarriesContext(t *testing.T) {
 			}
 			if q.Get("dir") == "/sub" {
 				sawSub = true
-				if strings.Contains(r.Header.Get("Cookie"), "BDCLND=%2Bsekey%3D") {
+				if strings.Contains(r.Header.Get("Cookie"), "BDCLND=+sekey=") {
 					sawBDCLND = true
 				}
 				_ = json.NewEncoder(w).Encode(map[string]any{
@@ -148,7 +152,7 @@ func TestResolveShareWalksAndCarriesContext(t *testing.T) {
 		t.Fatalf("names: %q %q", nodes[0].Name, nodes[1].Name)
 	}
 	for _, n := range nodes {
-		if n.Ext["share_id"] != "12345" || n.Ext["uk"] != "67890" || n.Ext["sekey"] != "%2Bsekey%3D" {
+		if n.Ext["share_id"] != "12345" || n.Ext["uk"] != "67890" || n.Ext["sekey"] != "+sekey=" {
 			t.Fatalf("missing context: %+v", n.Ext)
 		}
 	}
@@ -197,7 +201,7 @@ func TestResolveShareNeedsPwd(t *testing.T) {
 
 // 转存链:暂存目录 → 转存 → locatedownload 选 encrypt=0 → 清理副本。
 func TestGetDirectLinkTransferChain(t *testing.T) {
-	var transferred, cleaned bool
+	var transferred, cleaned, sawSekey bool
 	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/gettemplatevariable":
@@ -207,6 +211,9 @@ func TestGetDirectLinkTransferChain(t *testing.T) {
 		case "/share/transfer":
 			_ = r.ParseForm()
 			transferred = r.Form.Get("fsidlist") == `["111"]` && r.Form.Get("path") == "/panrouter_tmp"
+			// Ext 里存的是存量快照的编码形态,转存查询参数必须是**单次编码**的
+			// 解码值(即 "+sekey="),双编码会让百度回 200025 提取码错误。
+			sawSekey = r.URL.Query().Get("sekey") == "+sekey="
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"errno": 0,
 				"extra": map[string]any{"list": []map[string]any{
@@ -239,6 +246,9 @@ func TestGetDirectLinkTransferChain(t *testing.T) {
 	}
 	if !transferred {
 		t.Fatal("transfer body mismatch")
+	}
+	if !sawSekey {
+		t.Fatal("transfer 查询参数里的 sekey 必须是解码形态(单次编码),否则百度回 200025")
 	}
 	if dl.URL != "https://appall01.baidupcs.com/plain" {
 		t.Fatalf("want encrypt=0 https link, got %q", dl.URL)
@@ -336,4 +346,59 @@ func TestCookieHeader(t *testing.T) {
 		t.Fatalf("empty base: %q", got)
 	}
 	_ = url.Values{}
+}
+
+// sekey 归一化:百度 randsk 是 URL 编码形态,进查询参数前必须解码一次;
+// 已解码值必须原样返回(幂等),否则存量快照会被二次解码。
+func TestNormalizeSekey(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"%2Bsekey%3D", "+sekey="},        // verify 返回的编码形态 → 解码
+		{"+sekey=", "+sekey="},            // 已解码 → 原样(幂等)
+		{"abcDEF123", "abcDEF123"},        // 无 "%" 的普通 randsk → 原样
+		{"a%2Fb%2Bc%3D", "a/b+c="},        // 多个转义
+		{"%zz", "%zz"},                    // 非法转义 → 原样(不丢值)
+		{"", ""},                          // 空值
+		{"50%off", "50%off"},              // 含 "%" 但非合法转义序列 → 原样
+	}
+	for _, c := range cases {
+		if got := normalizeSekey(c.in); got != c.want {
+			t.Fatalf("normalizeSekey(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	if normalizeSekey(normalizeSekey("%2Bsekey%3D")) != "+sekey=" {
+		t.Fatal("normalizeSekey must be idempotent")
+	}
+}
+
+// 转存失败时百度只给 show_msg(生产实证 200025 的 errmsg 为空):
+// 必须把 show_msg 回填进错误文案,用户才知道是提取码问题。
+func TestTransferSurfacesShowMsg(t *testing.T) {
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/share/transfer":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"errno": 200025, "errmsg": "", "show_msg": "提取码输入错误,请重试",
+			})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	_, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+		FID: "111",
+		Ext: map[string]string{"share_id": "12345", "uk": "67890", "sekey": "+sekey="},
+	})
+	var de *driver.Error
+	if !errors.As(err, &de) {
+		t.Fatalf("want driver.Error, got %v", err)
+	}
+	if de.Kind != driver.KindNotFound {
+		t.Fatalf("kind=%s want not_found", de.Kind)
+	}
+	if !strings.Contains(de.UserHint, "提取码") {
+		t.Fatalf("show_msg 未回填到错误文案: %q", de.UserHint)
+	}
 }

@@ -488,8 +488,75 @@ func (r *Resolver) resolveFileSafe(ctx context.Context, rawURL, pwd, fid, client
 	return r.ResolveFile(ctx, rawURL, pwd, fid, false, clientUA)
 }
 
+// autoLinkLocalRetry 是「被我方准入闸拒绝」后的最大重试次数。
+// 本地令牌桶 capacity == rate 且 Allow 非阻塞,一次批量提链里前 2 个文件就会
+// 把桶打空;后面每个文件重试 3 次(每次等 1/limit_qps)足够把整批放完,
+// 又不至于把一次请求拖过 CF 524 的 100s 预算。
+const autoLinkLocalRetry = 3
+
+// resolveFilePaced 提链一次;若被**我方**准入闸(本地令牌桶 / 并发额度)拒绝,
+// 按限频间隔退避重试,而不是把整批的后续文件都判成失败。
+//
+// ★ 旧实现把本地准入拒绝当终态:生产实证(2026-11-17,百度 8 文件分享)
+//   只有 1 个文件走到上游(200025),其余 7 个全部 `本地限频:请求过于频繁`
+//   (panrouter_local_throttle_total{reason="rate_limit"} 7)。本地闸门的作用
+//   是**放慢我们自己发起的批量提链**,不是让用户的同一次解析请求部分失败。
+//
+// 熔断打开(kind=breaker)也走同一条重试路径:熔断有冷却窗口,退避几次正好
+// 跨过去;真正的上游错误照旧立刻返回。
+func (r *Resolver) resolveFilePaced(ctx context.Context, rawURL, pwd, fid, clientUA, pan string) (*ResolveFileResult, error) {
+	var err error
+	for attempt := 0; ; attempt++ {
+		var res *ResolveFileResult
+		res, err = r.resolveFileSafe(ctx, rawURL, pwd, fid, clientUA, pan)
+		if err == nil || !asLocalThrottle(err) || attempt >= autoLinkLocalRetry {
+			return res, err
+		}
+		r.met.Inc("panrouter_auto_link_retry_total", map[string]string{"pan": pan})
+		if !sleepCtx(ctx, r.localPaceInterval(pan)) {
+			return nil, err
+		}
+	}
+}
+
+// asLocalThrottle 报告错误是否来自我方准入(令牌桶 / 并发额度 / 熔断),
+// 而非上游风控。见 errLocalThrottle。
+func asLocalThrottle(err error) bool {
+	var lt *errLocalThrottle
+	return errors.As(err, &lt)
+}
+
+// sleepCtx 等待 d,ctx 结束则提前返回 false。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// localPaceInterval 是本地令牌桶补一个令牌的间隔(1/limit_qps),夹在
+// [100ms, 2s]:过小会空转,过大在极端低限频下会把单文件重试拖成秒级。
+func (r *Resolver) localPaceInterval(pan string) time.Duration {
+	qps := r.driverCfg(pan).LimitQPS
+	if qps <= 0 {
+		return 100 * time.Millisecond
+	}
+	d := time.Duration(float64(time.Second) / qps)
+	if d < 100*time.Millisecond {
+		d = 100 * time.Millisecond
+	}
+	if d > 2*time.Second {
+		d = 2 * time.Second
+	}
+	return d
+}
+
 // autoLinkSerial 逐个自动提链(基线语义):鉴权失败立即停、预算不足停、
-// 结果按原顺序回填。返回已尝试数/鉴权阻断/预算停止/提示。
+// 结果按原顺序回填。返回成功链接数/鉴权阻断/预算停止/提示。
 func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes []driver.FileNode,
 	items []FileItem, pending []int, clientUA, pan string) (linked int, authBlocked, budgetStop bool, hint string) {
 	for _, idx := range pending {
@@ -503,8 +570,7 @@ func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes
 			r.log.Warnw("auto-link skipped: deadline", "pan", pan, "fid", fid)
 			break
 		}
-		linked++
-		file, lerr := r.resolveFileSafe(ctx, rawURL, pwd, fid, clientUA, pan)
+		file, lerr := r.resolveFilePaced(ctx, rawURL, pwd, fid, clientUA, pan)
 		if lerr != nil {
 			kind := "upstream_error"
 			var de *driver.Error
@@ -526,6 +592,7 @@ func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes
 		} else {
 			items[idx].Route = file.Route
 			items[idx].DownloadURL = file.DownloadURL
+			linked++
 		}
 	}
 	return
@@ -582,14 +649,12 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 					mu.Unlock()
 					continue
 				}
-				mu.Lock()
-				linked++
-				mu.Unlock()
-				file, lerr := r.resolveFileSafe(cctx, rawURL, pwd, nodes[idx].FID, clientUA, pan)
+				file, lerr := r.resolveFilePaced(cctx, rawURL, pwd, nodes[idx].FID, clientUA, pan)
 				if lerr == nil {
 					mu.Lock()
 					items[idx].Route = file.Route
 					items[idx].DownloadURL = file.DownloadURL
+					linked++
 					mu.Unlock()
 					continue
 				}

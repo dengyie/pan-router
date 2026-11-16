@@ -32,7 +32,9 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 	if ref.Ext == nil {
 		return driver.DirectLink{}, driver.NewErr(driver.KindNotFound, "缺少百度分享上下文,请重新解析", nil)
 	}
-	shareID, uk, sekey := ref.Ext["share_id"], ref.Ext["uk"], ref.Ext["sekey"]
+	// sekey 归一化:新快照存的就是解码形态(verify 已归一化),存量快照存的是
+	// 百度返回的编码形态,这里统一成解码形态,避免查询参数双重编码(200025)。
+	shareID, uk, sekey := ref.Ext["share_id"], ref.Ext["uk"], normalizeSekey(ref.Ext["sekey"])
 
 	tmp := d.ensureTmpDir(ctx, cred)
 	if tmp != "" {
@@ -199,9 +201,10 @@ func (d *Driver) transfer(ctx context.Context, cookie, shareID, uk, sekey, fsid,
 		"&ondup=newcopy&web=1&app_id=" + appID +
 		"&bdstoken=" + url.QueryEscape(token) + "&clienttype=0"
 	var out struct {
-		Errno  int    `json:"errno"`
-		ErrMsg string `json:"errmsg"`
-		Extra  struct {
+		Errno   int    `json:"errno"`
+		ErrMsg  string `json:"errmsg"`
+		ShowMsg string `json:"show_msg"`
+		Extra   struct {
 			List []struct {
 				ToFsID string `json:"to_fs_id"`
 				To     string `json:"to"`
@@ -215,6 +218,12 @@ func (d *Driver) transfer(ctx context.Context, cookie, shareID, uk, sekey, fsid,
 	}, &out)
 	if err != nil {
 		return "", "", err
+	}
+	// 转存失败时百度常把真正的原因放在 show_msg,errmsg 留空:
+	// 生产实证 200025 只有 show_msg「提取码输入错误,请重试」。不回填的话
+	// 错误分类只能看到空文案,用户和维护者都无从判断。
+	if out.ErrMsg == "" {
+		out.ErrMsg = out.ShowMsg
 	}
 	if err := mustOK(out.Errno, out.ErrMsg); err != nil {
 		return "", "", err
