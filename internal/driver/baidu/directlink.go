@@ -83,15 +83,22 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 			d.forgetTmpDir(cred.Cookie)
 			return driver.DirectLink{}, err
 		}
+		// 台账里的路径日后会作为**批量删除**的目标发给上游,所以入账前必须确认
+		// 它真在暂存目录内。newPath 直接取自转存响应的 extra.list[0].to,是上游
+		// 输入,不能默认可信:接口改语义或异常响应给出越界路径时,清理会删掉
+		// 用户自己的文件,而删除不可逆。此处直接拒绝,不入账。
+		if !insideDir(newPath, tmp) {
+			d.forgetTmpDir(cred.Cookie)
+			return driver.DirectLink{}, driver.NewErr(driver.KindInterfaceChanged,
+				"百度转存返回的路径不在暂存目录内,已拒绝入账(疑似接口变更)", nil)
+		}
 		// 副本留在暂存目录里复用(不再用完即删),过期由 sweepCopies 批量清扫。
 		d.rememberCopy(cred.Cookie, shareID, ref.FID, copyEntry{
 			fsid: newFsid, path: newPath, sekey: sekey, at: time.Now(),
 		})
+		// locatedownload 抓包常量(psign 等)若被百度轮换,退回 filemetas 按 fs_id 取链。
 		if u, err := d.locateDownload(ctx, cred.Cookie, newPath); err == nil {
 			return d.linkFrom(cookieHeader(cred.Cookie, sekey), u), nil
-		} else {
-			// locatedownload 抓包常量(psign 等)若被百度轮换,退回 filemetas 按 fs_id 取链。
-			_ = err
 		}
 		token, err := d.getBdstoken(ctx, cred, false)
 		if err != nil {
@@ -416,13 +423,21 @@ func copyKey(cookie, shareID, fsid string) string {
 }
 
 // reuseCopy 查台账;命中且未闲置超时返回副本,调用方只重取直链即可。
+//
+// 命中即续租(at 刷新为当前时间):取直链要串行往返 locatedownload,失败还要
+// 现取 bdstoken + filemetas。若这段窗口里 at 仍是旧值,并发清扫会把这个**正在
+// 被复用**的副本判成闲置并删掉,请求随后报「副本不存在」,白白重转一次。
 func (d *Driver) reuseCopy(cookie, shareID, fsid string) (copyEntry, bool) {
+	k := copyKey(cookie, shareID, fsid)
+	now := time.Now()
 	d.copyMu.Lock()
-	e, ok := d.copies[copyKey(cookie, shareID, fsid)]
-	d.copyMu.Unlock()
-	if !ok || time.Since(e.at) > copyTTL {
+	defer d.copyMu.Unlock()
+	e, ok := d.copies[k]
+	if !ok || now.Sub(e.at) > copyTTL {
 		return copyEntry{}, false
 	}
+	e.at = now
+	d.copies[k] = e
 	return e, true
 }
 
@@ -466,6 +481,25 @@ func (d *Driver) dropCopies(items []sweepItem) {
 		}
 	}
 	d.copyMu.Unlock()
+}
+
+// splitGone 把台账里的闲置项分成「远端仍在」(keep)与「远端已删」(gone)。
+//
+// complete=false 表示目录列表被翻页上界截断:此时任何「不在列表里」都不可信,
+// 全部保留 —— 丢掉台账等于永久放弃清理它们(副本还在,却再没人认领)。
+func splitGone(idle []sweepItem, present map[string]struct{}, complete bool) (keep, gone []sweepItem) {
+	if !complete {
+		return idle, nil
+	}
+	keep = idle[:0]
+	for _, it := range idle {
+		if _, ok := present[it.path]; ok {
+			keep = append(keep, it)
+		} else {
+			gone = append(gone, it)
+		}
+	}
+	return keep, gone
 }
 
 // isRiskControl 判断错误是否为上游风控/安全验证拒绝(重试无意义,应退避)。
@@ -560,30 +594,42 @@ func (d *Driver) sweepCopies(ctx context.Context, cred *driver.Credential, dir s
 			d.dropCopies(forced)
 			return
 		}
-		entries, lerr := d.listDir(cleanCtx, cred.Cookie, dir)
+		entries, complete, lerr := d.listDir(cleanCtx, cred.Cookie, dir)
 		if lerr == nil {
 			present := make(map[string]struct{}, len(entries))
 			for _, it := range entries {
 				present[it.Path] = struct{}{}
 			}
-			// 远端已不存在的闲置台账项:直接清台账,不必再发删除。列表即使被
-			// 截断也无害——看不见的项照样会按路径发删除,删除成功才丢台账。
-			keep := idle[:0]
 			var gone []sweepItem
-			for _, it := range idle {
-				if _, ok := present[it.path]; ok {
-					keep = append(keep, it)
-				} else {
-					gone = append(gone, it)
-				}
-			}
-			idle = keep
+			idle, gone = splitGone(idle, present, complete)
 			d.dropCopies(gone)
 		}
+		// 台账里出现越界路径只可能是上游异常(入账处已拦,这里兜历史/新增路径):
+		// 这种项永远不该由我们删除,也不该继续占台账——否则每轮清扫都会重试它。
+		var bad []sweepItem
+		dropOutside := func(items []sweepItem) []sweepItem {
+			keep := items[:0]
+			for _, it := range items {
+				if insideDir(it.path, dir) {
+					keep = append(keep, it)
+				} else {
+					bad = append(bad, it)
+				}
+			}
+			return keep
+		}
+		forced, idle = dropOutside(forced), dropOutside(idle)
+		d.dropCopies(bad)
 		paths := make([]string, 0, len(forced)+len(idle)+len(entries))
 		seen := make(map[string]struct{}, len(forced)+len(idle))
 		add := func(p string) {
 			if p == "" {
+				return
+			}
+			// 删除不可逆,路径必须确实在暂存目录内。台账 path 来自上游转存响应
+			// (extra.list[0].to),入账处已校验;这里再挡一道,任何将来新增的
+			// 入账路径都不会绕过。
+			if !insideDir(p, dir) {
 				return
 			}
 			if _, ok := live[p]; ok {
@@ -641,19 +687,45 @@ type dirEntry struct {
 	ServerMtime int64  `json:"server_mtime"`
 }
 
-// dirListNum 暂存目录单页条数(台账上限 80,单页足够)。
+// dirListNum 暂存目录单页条数(台账上限 80,单页足够;超大目录靠翻页)。
 const dirListNum = 1000
 
-// listDir 列出暂存目录内容(清理的远端真源)。
+// dirListMax 是单次清扫最多看的条数。触顶返回 complete=false:此时列表是截断的,
+// 调用方不得用「不在列表里」推断远端已删(否则会丢掉仍在的台账项)。下一轮清扫
+// 会重新从最新一页开始,逐轮推进。
+const dirListMax = 10000
+
+// listDir 列出暂存目录内容(清理的远端真源),翻页直到不满一页。
 //
 // 走 xpan `/rest/2.0/xpan/file?method=list`,不走 web 的 `/api/list`:后者即便
 // 登录态有效也恒回 `{"errno":8888,"errmsg":"test"}`(生产实证 2026-11-17,用
 // 驱动同款 Cookie/bdstoken 与两套 UA 复刻四种参数组合皆然),清扫若以它为
 // 真源则永远拿到空列表 —— 重启遗留的孤儿副本一个也清不掉,还会把它们全判成
 // 「远端不存在」而丢掉台账。
-func (d *Driver) listDir(ctx context.Context, cookie, dir string) ([]dirEntry, error) {
+//
+// ★ 必须翻页:单页 limit 的旧实现把「一页」当「全量」。目录超过一页时,最旧的
+// 台账项不在结果里 → 被误判为远端已删、丢台账,又不进删除列表,变成无人认领的
+// 永久孤儿(同时让 maxCopiesPerAccount 的内存上界失效)。complete 就是这个
+// 不确定性的显式出口。
+func (d *Driver) listDir(ctx context.Context, cookie, dir string) (entries []dirEntry, complete bool, err error) {
+	for start := 0; ; start += dirListNum {
+		page, err := d.listDirPage(ctx, cookie, dir, start)
+		if err != nil {
+			return nil, false, err
+		}
+		entries = append(entries, page...)
+		if len(page) < dirListNum {
+			return entries, true, nil
+		}
+		if start+dirListNum >= dirListMax {
+			return entries, false, nil
+		}
+	}
+}
+
+func (d *Driver) listDirPage(ctx context.Context, cookie, dir string, start int) ([]dirEntry, error) {
 	u := d.base + "/rest/2.0/xpan/file?method=list&dir=" + url.QueryEscape(dir) +
-		"&order=time&desc=1&start=0&limit=" + itoa(dirListNum) + "&web=1"
+		"&order=time&desc=1&start=" + itoa(start) + "&limit=" + itoa(dirListNum) + "&web=1"
 	var out struct {
 		Errno  int        `json:"errno"`
 		ErrMsg string     `json:"errmsg"`
@@ -666,6 +738,24 @@ func (d *Driver) listDir(ctx context.Context, cookie, dir string) ([]dirEntry, e
 		return nil, err
 	}
 	return out.List, nil
+}
+
+// insideDir 判断 p 是否确实位于 dir 之内(严格子路径)。
+//
+// 批量删除的目标路径不能只看「上游说是这里」:删除不可逆,一旦上游改语义或
+// 返回越界路径(含 `..` 穿越),清理就会删掉用户自己的文件。故同时要求前缀
+// 匹配且路径段里没有 `.`/`..`/空段。
+func insideDir(p, dir string) bool {
+	base := strings.TrimRight(dir, "/")
+	if base == "" || p == base || !strings.HasPrefix(p, base+"/") {
+		return false
+	}
+	for _, seg := range strings.Split(strings.TrimPrefix(p, base+"/"), "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // deletePaths 批量删除暂存目录内的副本,返回本次删除是否被接受。

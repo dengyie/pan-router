@@ -41,8 +41,9 @@ const (
 	appID   = "250528"
 	referer = "https://pan.baidu.com/"
 
-	// tmpDirName 是转存专用暂存目录(网盘根目录下);清理只删该目录内的副本,
-	// 避免误删用户自己的文件。
+	// tmpDirName 是转存专用暂存目录(网盘根目录下);清扫只删该目录内的副本,
+	// 避免误删用户自己的文件 —— 由 insideDir 在「入账」与「发删除」两处强制
+	// 校验,不假设上游响应里的路径可信。
 	tmpDirName = "panrouter_tmp"
 	// linkTTL 保守取值:locatedownload/filemetas 的直链其实按小时计,但我们按
 	// 45 分钟缓存,过期由 Resolver 走 singleflight 续签。
@@ -267,13 +268,15 @@ func (d *Driver) call(ctx context.Context, method, rawURL string, form url.Value
 	if err != nil {
 		return nil, driver.NewErr(driver.KindUpstream, "百度网络请求失败", err)
 	}
+	// 空响应一律按上游异常处理,不因调用方没要解码结果就放过:旧实现只在
+	// out != nil 时判空,一旦将来出现 out == nil 的调用,空回包又会被当成功
+	// (把没建成的目录当已建好)。当前所有调用点都传了 out,所以行为不变,
+	// 只是把「空体即异常」变成不依赖调用点的恒定契约。
+	if len(res.Body) == 0 {
+		return res, driver.NewErr(driver.KindUpstream,
+			"百度返回空响应(HTTP "+itoa(res.StatusCode)+")", nil)
+	}
 	if out != nil {
-		if len(res.Body) == 0 {
-			// 旧实现把空响应当「解码成功」继续走:errno 零值 == 0,调用方会把
-			// 一次空回包当成功(例如把没建成的暂存目录当已建好)。
-			return res, driver.NewErr(driver.KindUpstream,
-				"百度返回空响应(HTTP "+itoa(res.StatusCode)+")", nil)
-		}
 		if err := json.Unmarshal(res.Body, out); err != nil {
 			return res, classifyBadBody(res, err)
 		}

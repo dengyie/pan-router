@@ -159,14 +159,17 @@ func TestPoolStateCountsCoolingOnly(t *testing.T) {
 	if err != nil || len(accs) != 1 {
 		t.Fatalf("seed account: %v %d", err, len(accs))
 	}
-	if total, cooling, _ := resolver.accounts.PoolState("fake"); total != 1 || cooling != 0 {
-		t.Fatalf("正常账号不应算冷却: total=%d cooling=%d", total, cooling)
+	if total, cooling, _, err := resolver.accounts.PoolState("fake"); err != nil || total != 1 || cooling != 0 {
+		t.Fatalf("正常账号不应算冷却: total=%d cooling=%d err=%v", total, cooling, err)
 	}
 	until := time.Now().Add(2 * time.Minute)
 	if err := store.MarkAccountCooldown(accs[0].ID, until); err != nil {
 		t.Fatal(err)
 	}
-	total, cooling, ready := resolver.accounts.PoolState("fake")
+	total, cooling, ready, err := resolver.accounts.PoolState("fake")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if total != 1 || cooling != 1 {
 		t.Fatalf("冷却中账号应被统计: total=%d cooling=%d", total, cooling)
 	}
@@ -177,8 +180,8 @@ func TestPoolStateCountsCoolingOnly(t *testing.T) {
 	if err := store.MarkAccountCooldown(accs[0].ID, time.Now().Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if _, cooling, _ := resolver.accounts.PoolState("fake"); cooling != 0 {
-		t.Fatalf("到期冷却不应再统计, cooling=%d", cooling)
+	if _, cooling, _, err := resolver.accounts.PoolState("fake"); err != nil || cooling != 0 {
+		t.Fatalf("到期冷却不应再统计, cooling=%d err=%v", cooling, err)
 	}
 }
 
@@ -257,5 +260,51 @@ func TestResolveShareCoolingAccountExplainsEveryFile(t *testing.T) {
 		if !strings.Contains(f.LinkError, "冷却") {
 			t.Fatalf("第 %d 个文件应说明冷却原因, got %q", i, f.LinkError)
 		}
+	}
+}
+
+// 并发 worker 会在 stop 生效前各自命中同一个鉴权失败:同一句提示只能出现一次。
+func TestAutoLinkParallelDedupesHints(t *testing.T) {
+	d := &twoFileDriver{fn: func(context.Context, string) (driver.DirectLink, error) {
+		return driver.DirectLink{}, driver.NewErr(driver.KindAuthExpired, "凭据已失效,请更新", nil)
+	}}
+	resolver, store := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	seedCookieAccount(t, store)
+
+	nodes := []driver.FileNode{{FID: "f1", Name: "a.bin"}, {FID: "f2", Name: "b.bin"}}
+	items := []FileItem{{FID: "f1", Name: "a.bin"}, {FID: "f2", Name: "b.bin"}}
+	_, authBlocked, _, hint := resolver.autoLinkParallel(WithAuthed(context.Background(), true),
+		testShareURL, "", nodes, items, []int{0, 1}, 2, "", "fake")
+	if !authBlocked {
+		t.Fatal("鉴权失败应判定为停链")
+	}
+	if got := strings.Count(hint, "凭据已失效"); got != 1 {
+		t.Fatalf("同一提示只应出现一次, got %d 次: %q", got, hint)
+	}
+}
+
+// 账号池查询失败不得伪装成「没配账号」:那会把用户引去账号页做无效操作,
+// 真因(DB 忙/锁/磁盘)也看不到。
+func TestPoolStateSurfacesStoreError(t *testing.T) {
+	resolver, store := newTestResolver(t, &twoFileDriver{},
+		config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	seedCookieAccount(t, store)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if _, _, _, err := resolver.accounts.PoolState("fake"); err == nil {
+		t.Fatal("ListAccounts 失败必须向上返回错误,不能拿全零顶替")
+	}
+	err := resolver.mapErr(WithAuthed(context.Background(), true), "fake", nil,
+		driver.NewErr(driver.KindAuthExpired, "上游要求登录态", nil))
+	var de *driver.Error
+	if !errors.As(err, &de) {
+		t.Fatalf("want driver.Error, got %v", err)
+	}
+	if strings.Contains(de.UserHint, "添加账号") {
+		t.Fatalf("DB 故障不得提示「添加账号」: %q", de.UserHint)
+	}
+	if !strings.Contains(de.UserHint, "暂不可用") {
+		t.Fatalf("应给中性提示: %q", de.UserHint)
 	}
 }

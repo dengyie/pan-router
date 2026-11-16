@@ -500,3 +500,24 @@ func TestGetNoRetryWhenContextExhausted(t *testing.T) {
 		t.Fatalf("ctx 已取消不应重试, calls=%d", n)
 	}
 }
+
+// 限流不得原地重试:限流窗口里把调用量翻倍只会延长限流,退避应由账号冷却
+// 与调用方节奏负责。这里锁住「KindRiskControl 不重试」这条边界。
+func TestGetDoesNotRetryRiskControl(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"code":500,"message":"too many requests, please retry later","data":null}`))
+	}))
+	defer srv.Close()
+
+	api := NewAPI(newClient(t), srv.URL, "tok-1")
+	_, err := api.Get(context.Background(), "/Pool/a.mkv")
+	var de *driver.Error
+	if !errors.As(err, &de) || de.Kind != driver.KindRiskControl {
+		t.Fatalf("want risk_control, got %v", err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("限流不应原地重试, calls=%d", n)
+	}
+}

@@ -69,3 +69,21 @@ func TestLogCauseNil(t *testing.T) {
 		t.Fatalf("nil 应返回空串, got %q", got)
 	}
 }
+
+// 百度 share/transfer 把分享验证密钥放在查询串的 sekey 里(协议里的另一个名字
+// 是 randsk),传输层错误会带完整 URL 进 de.Err —— 两个名字都必须抹。
+func TestLogCauseRedactsSeKeyAndRandsk(t *testing.T) {
+	cases := []string{
+		`Post "https://pan.baidu.com/share/transfer?shareid=1&from=2&sekey=SECRET123&web=1": EOF`,
+		`Post "https://pan.baidu.com/share/transfer?randsk=SECRET123": EOF`,
+	}
+	for _, in := range cases {
+		got := logCause(errors.New(in))
+		if strings.Contains(got, "SECRET123") {
+			t.Fatalf("分享验证密钥不得入日志: in=%q got=%q", in, got)
+		}
+		if !strings.Contains(got, "***") {
+			t.Fatalf("应被抹掉: in=%q got=%q", in, got)
+		}
+	}
+}

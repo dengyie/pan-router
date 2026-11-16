@@ -219,10 +219,12 @@ func (s *AccountService) checkAcc(ctx context.Context, acc *repo.Account, drv dr
 // 冷却。生产实证(2026-11-17,百度 9013):9 文件分享里第 1 个如实报「转存被
 // 限制」,第 2 个却报「该网盘需要登录态,请先添加账号」——账号明明在库里。
 // total=0 才是真的没配账号;cooling>0 且 Pick 选不出,说明全池都在降温。
-func (s *AccountService) PoolState(pan string) (total, cooling int, nextReady time.Time) {
-	list, err := s.store.ListAccounts(pan)
-	if err != nil {
-		return 0, 0, time.Time{}
+func (s *AccountService) PoolState(pan string) (total, cooling int, nextReady time.Time, err error) {
+	list, lerr := s.store.ListAccounts(pan)
+	if lerr != nil {
+		// 不能拿全零顶替:调用方会把「查询失败」误判成「没配账号」,给出
+		// 误导性的「请先添加账号」,而真因(DB 忙/锁/磁盘)被吞掉。
+		return 0, 0, time.Time{}, lerr
 	}
 	now := time.Now()
 	for i := range list {
@@ -239,7 +241,7 @@ func (s *AccountService) PoolState(pan string) (total, cooling int, nextReady ti
 			nextReady = *list[i].CooldownUntil
 		}
 	}
-	return total, cooling, nextReady
+	return total, cooling, nextReady, nil
 }
 
 // MarkStatus 供 resolver 在 AuthExpired 时标记账号失效。

@@ -298,8 +298,14 @@ func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, er
 			// 账号全部过期封禁。生产实证(2026-11-17,百度 9013):第 1 个文件
 			// 如实报「转存被限制」后账号进入 5min 冷却,第 2 个文件却提示
 			// 「请先在账号管理添加账号」——用户会去账号页找一个明明存在的账号。
-			total, cooling, nextReady := r.accounts.PoolState(pan)
+			total, cooling, nextReady, perr := r.accounts.PoolState(pan)
 			switch {
+			case perr != nil:
+				// 账号池查询失败 ≠ 没配账号。旧行为返回全零,提示会变成
+				// 「请先添加账号」,把用户引去账号页做无效操作,运维也看不到
+				// DB 异常。这里给中性提示,真因进日志。
+				r.log.Warnw("pool state unavailable", "pan", pan, "err", perr)
+				de.UserHint = "该网盘账号暂不可用,请稍后重试;" + de.UserHint
 			case cooling > 0:
 				wait := time.Until(nextReady)
 				if wait < time.Second {
@@ -322,9 +328,13 @@ func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, er
 	// de.Err 里才有真因;不记的话线上只剩「网络请求失败」这类统一文案,排障时
 	// 无从区分「隧道断了」与「上游 5xx」——2026-11-17 mangodrive 三次 502 就是
 	// 这样瞎掉的。只记有原因的那部分(纯业务码错误 de.Err 为 nil,不刷日志)。
+	//
+	// 这里只记 cause,不记 hint:autoLink 层紧接着会为同一个失败记一行
+	// `auto-link failed`(带 fid + hint),两行各司其职——cause 给运维看真因,
+	// hint/fid 给「哪个文件怎么了」定位。两行都带 hint 只是把同一句话写两遍。
 	if de.Err != nil {
 		r.log.Warnw("driver error",
-			"pan", pan, "kind", de.Kind, "hint", de.UserHint, "cause", logCause(de.Err))
+			"pan", pan, "kind", de.Kind, "cause", logCause(de.Err))
 	}
 	return err
 }
@@ -339,8 +349,21 @@ const logCauseLimit = 300
 // `?token=xxx&a=1` 与请求头 `Authorization: Bearer xxx` / `Cookie: a=b; c=d`,
 // 后者带空格,按空白截断只会把 "Bearer" 抹掉、把真正的令牌留在日志里。
 // 宁可多抹(整行尾部)也不能漏。
+//
+// sekey/randsk 必须单列:百度 `/share/transfer?...&sekey=<randsk>` 把分享验证
+// 密钥放在查询串里,而传输层错误(`*url.Error`)会带完整 URL 进 de.Err。同一个
+// 密钥在协议里有两个名字(Cookie 侧叫 BDCLND),脱敏名单也得两个都有。
 var logCauseRe = regexp.MustCompile(
-	`(?i)(bduss(?:_bfess)?|stoken|ptoken|baiduid|bdclnd|access_token|token|cookie|authorization)=[^&\r\n"']*`)
+	`(?i)(bduss(?:_bfess)?|stoken|ptoken|baiduid|bdclnd|access_token|token|cookie|authorization|sekey|randsk)=[^&\r\n"']*`)
+
+// redact 是脱敏的唯一入口:日志里的 cause 与 hint 都走它,避免「只给 cause
+// 加了脱敏、hint 漏掉」这类分叉。
+func redact(s string) string {
+	if s == "" {
+		return ""
+	}
+	return logCauseRe.ReplaceAllString(s, "$1=***")
+}
 
 // logCause 把被包装的上游原因整理成一行:先截断再抹凭据,顺序与 baidu.snippet
 // 一致(先限长,避免对超长错误串跑正则)。按 rune 截断,不切碎多字节字符。
@@ -352,7 +375,7 @@ func logCause(err error) string {
 	if r := []rune(s); len(r) > logCauseLimit {
 		s = string(r[:logCauseLimit]) + "…"
 	}
-	return logCauseRe.ReplaceAllString(s, "$1=***")
+	return redact(s)
 }
 
 type resolverCtxKey int
@@ -663,7 +686,7 @@ func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes
 					stopMsg = "请求已超时或取消,未继续自动提链"
 				}
 			}
-			r.log.Warnw("auto-link failed", "pan", pan, "fid", fid, "kind", kind, "hint", items[idx].LinkError)
+			r.log.Warnw("auto-link failed", "pan", pan, "fid", fid, "kind", kind, "hint", redact(items[idx].LinkError))
 		} else {
 			items[idx].Route = file.Route
 			items[idx].DownloadURL = file.DownloadURL
@@ -688,9 +711,28 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 	var (
 		mu          sync.Mutex
 		stop        bool
-		stoppedByUs bool   // 主动 cancel 后,在途任务返回的 context 错误不算失败
-		stopMsg     string // 停链原因:给未尝试的文件补 link_error
+		stoppedByUs bool     // 主动 cancel 后,在途任务返回的 context 错误不算失败
+		stopMsg     string   // 停链原因:给未尝试的文件补 link_error
+		hintParts   []string // 去重后的提示片段,末尾统一 join
+		hintSeen    = map[string]struct{}{}
 	)
+	// addHint 按「分句」去重:并发 worker 会在 stop 生效前各自命中同一个鉴权
+	// 失败,不去重的话响应里会出现「提示;提示;提示」。按分句而不是整串去重,
+	// 是因为 mapErr 会把状态前缀拼到同一个 hint 前面(A 与「B;A」),整串比对
+	// 抓不到这种实质重复。调用方须持 mu。
+	addHint := func(msg string) {
+		for _, seg := range strings.Split(msg, ";") {
+			seg = strings.TrimSpace(seg)
+			if seg == "" {
+				continue
+			}
+			if _, ok := hintSeen[seg]; ok {
+				continue
+			}
+			hintSeen[seg] = struct{}{}
+			hintParts = append(hintParts, seg)
+		}
+	}
 	stopAll := func() {
 		mu.Lock()
 		stop, stoppedByUs = true, true
@@ -721,7 +763,7 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 					mu.Lock()
 					if !stop {
 						stop, budgetStop = true, true
-						hint = joinHints(hint, "请求剩余时间不足,未继续自动提链")
+						addHint("请求剩余时间不足,未继续自动提链")
 						stopMsg = "请求剩余时间不足,未继续自动提链"
 					}
 					mu.Unlock()
@@ -757,18 +799,18 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 				items[idx].LinkError = hintText
 				if authFail {
 					authBlocked = true
-					hint = joinHints(hint, de.UserHint)
+					addHint(de.UserHint)
 					stopMsg = de.UserHint
 				}
 				if errors.Is(lerr, context.DeadlineExceeded) || errors.Is(lerr, context.Canceled) {
 					budgetStop = true
-					hint = joinHints(hint, "请求已超时或取消,未继续自动提链")
+					addHint("请求已超时或取消,未继续自动提链")
 					if stopMsg == "" {
 						stopMsg = "请求已超时或取消,未继续自动提链"
 					}
 				}
 				mu.Unlock()
-				r.log.Warnw("auto-link failed", "pan", pan, "fid", nodes[idx].FID, "kind", kind, "hint", hintText)
+				r.log.Warnw("auto-link failed", "pan", pan, "fid", nodes[idx].FID, "kind", kind, "hint", redact(hintText))
 				if authFail {
 					stopAll()
 				}
@@ -776,6 +818,7 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 		}()
 	}
 	wg.Wait()
+	hint = strings.Join(hintParts, ";")
 	fillUnlinked(items, pending, stopMsg)
 	return
 }

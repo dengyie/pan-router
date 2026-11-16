@@ -145,11 +145,14 @@ func (a *API) Me(ctx context.Context) (string, error) {
 	return out.Username, nil
 }
 
-// retriableErr 判断错误是否值得原样再试一次:只有上游抖动/限流(Retriable)
+// retriableErr 判断错误是否值得原样再试一次:只有上游/传输层异常(Upstream)
 // 有意义;参数错误、鉴权失效、路径不存在重试一次只是白花调用。
+//
+// ★ 限流(KindRiskControl)刻意排除:限流窗口里立刻重试只会把调用量翻倍,
+// 反而延长限流;退避应由账号冷却与调用方节奏负责,不是原地再打一次。
 func retriableErr(err error) bool {
 	var de *driver.Error
-	return errors.As(err, &de) && de.Retriable
+	return errors.As(err, &de) && de.Kind == driver.KindUpstream
 }
 
 // Get 读取单个路径的元数据(文件含 raw_url;目录 is_dir=true)。

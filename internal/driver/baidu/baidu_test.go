@@ -975,3 +975,166 @@ func TestEmptyBodyIsUpstreamError(t *testing.T) {
 		t.Fatalf("提示应说明是空响应: %q", de.UserHint)
 	}
 }
+
+// 转存响应里的路径是上游输入:一旦越出暂存目录,绝不能入账——台账路径日后会
+// 作为批量删除的目标,删的是用户自己的文件且不可逆。
+func TestTransferPathOutsideTmpDirRejected(t *testing.T) {
+	var deleted bool
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/rest/2.0/xpan/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
+		case "/share/transfer":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
+				{"to_fs_id": "999", "to": "/我的资源/important.mkv"},
+			}}})
+		case "/api/filemanager":
+			deleted = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	_, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+		FID: "111", Ext: map[string]string{"share_id": "12345", "uk": "67890"},
+	})
+	var de *driver.Error
+	if !errors.As(err, &de) || de.Kind != driver.KindInterfaceChanged {
+		t.Fatalf("越界转存路径必须拒绝并报 interface_changed, got %v", err)
+	}
+	if d.ledgerHas(cred().Cookie, "12345", "111") {
+		t.Fatal("越界路径不得入账:台账会被清扫当删除目标")
+	}
+	d.waitSweep()
+	if deleted {
+		t.Fatal("越界路径不得触发删除")
+	}
+}
+
+// 历史台账里若已存在越界路径(入账校验之前写入的),清扫必须既不删也不留。
+func TestSweepDropsLedgerPathOutsideTmpDir(t *testing.T) {
+	var deletedList string
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/rest/2.0/xpan/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
+		case "/share/transfer":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
+				{"to_fs_id": "999", "to": "/panrouter_tmp/new.bin"},
+			}}})
+		case "/rest/2.0/pcs/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "urls": []map[string]any{
+				{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0},
+			}})
+		case "/api/filemanager":
+			_ = r.ParseForm()
+			deletedList = r.Form.Get("filelist")
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	old := time.Now().Add(-2 * copyTTL)
+	d.rememberCopy(cred().Cookie, "BAD", "9", copyEntry{
+		fsid: "777", path: "/我的资源/important.mkv", at: old,
+	})
+
+	if _, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+		FID: "111", Ext: map[string]string{"share_id": "12345", "uk": "67890"},
+	}); err != nil {
+		t.Fatalf("GetDirectLink: %v", err)
+	}
+	d.waitSweep()
+	if strings.Contains(deletedList, "我的资源") {
+		t.Fatalf("越界台账路径绝不能进删除请求, filelist=%q", deletedList)
+	}
+	if d.ledgerHas(cred().Cookie, "BAD", "9") {
+		t.Fatal("越界台账项应被丢弃(永远不该由我们删除,留着只会每轮重试)")
+	}
+}
+
+// 列表被截断时不得按「不在列表里」判远端已删。
+func TestSplitGoneKeepsLedgerWhenListingIncomplete(t *testing.T) {
+	idle := []sweepItem{
+		{key: "a", path: "/panrouter_tmp/a.bin"},
+		{key: "b", path: "/panrouter_tmp/b.bin"},
+	}
+	present := map[string]struct{}{"/panrouter_tmp/a.bin": {}}
+
+	keep, gone := splitGone(append([]sweepItem(nil), idle...), present, true)
+	if len(keep) != 1 || len(gone) != 1 || keep[0].key != "a" || gone[0].key != "b" {
+		t.Fatalf("完整列表:keep=%+v gone=%+v", keep, gone)
+	}
+
+	keep, gone = splitGone(append([]sweepItem(nil), idle...), present, false)
+	if len(keep) != 2 || len(gone) != 0 {
+		t.Fatalf("截断列表不得丢台账:keep=%+v gone=%+v", keep, gone)
+	}
+}
+
+// 目录超过单页时必须翻页:单页当全量会把最旧的台账项误判成「远端已删」。
+func TestListDirPaginates(t *testing.T) {
+	var starts []string
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rest/2.0/xpan/file" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			return
+		}
+		start := r.URL.Query().Get("start")
+		starts = append(starts, start)
+		list := []map[string]any{}
+		if start == "0" {
+			for i := 0; i < dirListNum; i++ {
+				list = append(list, map[string]any{
+					"path": "/panrouter_tmp/f" + itoa(i), "server_mtime": time.Now().Unix(),
+				})
+			}
+		} else {
+			list = append(list, map[string]any{
+				"path": "/panrouter_tmp/last.bin", "server_mtime": time.Now().Unix(),
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": list})
+	}))
+
+	entries, complete, err := d.listDir(context.Background(), cred().Cookie, "/panrouter_tmp")
+	if err != nil {
+		t.Fatalf("listDir: %v", err)
+	}
+	if !complete {
+		t.Fatal("不满一页即到底,complete 应为 true")
+	}
+	if len(entries) != dirListNum+1 {
+		t.Fatalf("翻页后应拿到 %d 条, got %d", dirListNum+1, len(entries))
+	}
+	if len(starts) != 2 || starts[0] != "0" || starts[1] != itoa(dirListNum) {
+		t.Fatalf("翻页 start 序列不对: %v", starts)
+	}
+}
+
+// 复用命中即续租:否则「正在取链」的副本会被并发清扫判成闲置并删掉。
+func TestReuseCopyLeasesOnHit(t *testing.T) {
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+	}))
+	old := time.Now().Add(-copyTTL + time.Minute)
+	d.rememberCopy(cred().Cookie, "12345", "111", copyEntry{
+		fsid: "999", path: "/panrouter_tmp/a.bin", at: old,
+	})
+	if _, ok := d.reuseCopy(cred().Cookie, "12345", "111"); !ok {
+		t.Fatal("未过期副本应命中复用")
+	}
+	if got := time.Since(d.ledgerAt(cred().Cookie, "12345", "111")); got > 2*time.Second {
+		t.Fatalf("命中复用必须续租 at, 距现在 %v", got)
+	}
+}
