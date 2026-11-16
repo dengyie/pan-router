@@ -401,3 +401,88 @@ func TestListStopsWhenTotalReached(t *testing.T) {
 		t.Fatalf("total=250 时应翻到第 2 页后停止,实际请求页=%v", servedPages)
 	}
 }
+
+// TestGetRetriesTransientFailureOnce 锁住根节点读取的「瞬时失败重试一次」。
+// 第一次请求在传输层被断开(模拟 EasyTier 隧道重建窗口:连接在 ~10s 后被断,
+// 客户端拿到的是传输错误而不是 HTTP 状态),第二次成功。
+// 生产实证 2026-11-17 03:16:同一份 share 连续三次 resolve 都在 ~10.07s 报
+// upstream_error,隧道恢复后同一请求 0.12~0.28s 成功——根节点单发会把整次
+// 解析打死,所以补这层与 listTree 子树一致的兜底。
+func TestGetRetriesTransientFailureOnce(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
+					return
+				}
+			}
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"name":"a.mkv","is_dir":false,"size":1024}}`))
+	}))
+	defer srv.Close()
+
+	api := NewAPI(newClient(t), srv.URL, "tok-1")
+	obj, err := api.Get(context.Background(), "/Pool/a.mkv")
+	if err != nil {
+		t.Fatalf("瞬时失败应重试一次后成功: %v", err)
+	}
+	if obj.Name != "a.mkv" || obj.IsDir {
+		t.Fatalf("unexpected obj: %+v", obj)
+	}
+	if calls != 2 {
+		t.Fatalf("应恰好重试一次(calls=2), got %d", calls)
+	}
+}
+
+// TestGetDoesNotRetryPermanentError 锁住「只有可重试类别才重试」:
+// 路径不存在/鉴权失效是确定性结果,重试只会白花一次上游调用。
+func TestGetDoesNotRetryPermanentError(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"code":500,"message":"object not found","data":null}`))
+	}))
+	defer srv.Close()
+
+	api := NewAPI(newClient(t), srv.URL, "tok-1")
+	_, err := api.Get(context.Background(), "/nope")
+	var de *driver.Error
+	if !errors.As(err, &de) || de.Kind != driver.KindNotFound {
+		t.Fatalf("want not_found, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("确定性错误不应重试, calls=%d", calls)
+	}
+}
+
+// TestGetNoRetryWhenContextExhausted:ctx 已没有预算时不再重试,避免把
+// 一次超时翻成两次、把 90s 的 resolve 预算烧光。
+func TestGetNoRetryWhenContextExhausted(t *testing.T) {
+	var calls int
+	// 用显式 release,不依赖 <-r.Context().Done():httptest.Server.Close 会等
+	// 处理函数返回,而「ctx 到期断开连接」与 handler 侧感知未必同一刻,挂住会让
+	// Close 空等(本地实测 601s 才结束)。defer 是 LIFO:close(release) 先于
+	// srv.Close() 执行,handler 得以返回。
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		<-release // 挂住直到客户端取消
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	api := NewAPI(newClient(t), srv.URL, "tok-1")
+	if _, err := api.Get(ctx, "/Pool/a.mkv"); err == nil {
+		t.Fatal("want error")
+	}
+	if calls != 1 {
+		t.Fatalf("ctx 已取消不应重试, calls=%d", calls)
+	}
+}

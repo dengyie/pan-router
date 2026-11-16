@@ -145,8 +145,29 @@ func (a *API) Me(ctx context.Context) (string, error) {
 	return out.Username, nil
 }
 
+// retriableErr 判断错误是否值得原样再试一次:只有上游抖动/限流(Retriable)
+// 有意义;参数错误、鉴权失效、路径不存在重试一次只是白花调用。
+func retriableErr(err error) bool {
+	var de *driver.Error
+	return errors.As(err, &de) && de.Retriable
+}
+
 // Get 读取单个路径的元数据(文件含 raw_url;目录 is_dir=true)。
+//
+// 根节点读取是整次解析的唯一入口(目录树靠它判 is_dir,单文件分享直接返回它),
+// 一次瞬时抖动就会把整个 resolve 打成 502。生产实证(2026-11-17 03:16,pxed→
+// aws-tokyo 的 EasyTier 隧道重建窗口):连续三次解析都在 ~10.07s 失败,隧道恢复后
+// 同一请求 0.12~0.28s 成功。与 listTree 子树「瞬时失败重试一次」同一语义,
+// 根节点也补上同样的兜底;重试前确认 ctx 还有预算,避免把超时再翻一倍。
 func (a *API) Get(ctx context.Context, p string) (*Obj, error) {
+	obj, err := a.get(ctx, p)
+	if err != nil && retriableErr(err) && ctx.Err() == nil {
+		obj, err = a.get(ctx, p)
+	}
+	return obj, err
+}
+
+func (a *API) get(ctx context.Context, p string) (*Obj, error) {
 	var out Obj
 	if err := a.do(ctx, http.MethodPost, "/api/fs/get",
 		map[string]any{"path": p, "password": ""}, &out); err != nil {
