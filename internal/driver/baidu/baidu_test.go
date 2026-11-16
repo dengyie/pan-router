@@ -69,6 +69,8 @@ func TestClassifyErrno(t *testing.T) {
 		{140, "", driver.KindShareGone},
 		{113, "", driver.KindShareGone},
 		{9019, "", driver.KindRiskControl},
+		// 转存黑名单:高频「转存→删除」触发,不可重试,必须明确报风控。
+		{9013, "hit black uid share transfer", driver.KindRiskControl},
 		{31066, "", driver.KindRiskControl},
 		{31061, "", driver.KindConflict},
 		{111, "", driver.KindUpstream},
@@ -199,9 +201,10 @@ func TestResolveShareNeedsPwd(t *testing.T) {
 	}
 }
 
-// 转存链:暂存目录 → 转存 → locatedownload 选 encrypt=0 → 清理副本。
+// 转存链:暂存目录 → 转存 → locatedownload 选 encrypt=0;副本留在台账里复用,
+// **不**在提链后立刻删除(那正是把账号送进转存黑名单的循环)。
 func TestGetDirectLinkTransferChain(t *testing.T) {
-	var transferred, cleaned, sawSekey bool
+	var transferred, sawSekey, deleted bool
 	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/gettemplatevariable":
@@ -229,8 +232,7 @@ func TestGetDirectLinkTransferChain(t *testing.T) {
 				},
 			})
 		case "/api/filemanager":
-			_ = r.ParseForm()
-			cleaned = strings.Contains(r.Form.Get("filelist"), "/panrouter_tmp/a.bin")
+			deleted = true
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -256,8 +258,147 @@ func TestGetDirectLinkTransferChain(t *testing.T) {
 	if dl.UA != NetdiskUA || !strings.Contains(dl.Cookie, "BDUSS=abc") {
 		t.Fatalf("link constraints: ua=%q cookie=%q", dl.UA, dl.Cookie)
 	}
-	if !cleaned {
-		t.Fatal("transferred copy must be cleaned up")
+	if deleted {
+		t.Fatal("首次提链不得立刻删除副本:高频「转存→删除」会被百度拉黑转存权限(errno=9013)")
+	}
+	if _, ok := d.reuseCopy(cred().Cookie, "12345", "111"); !ok {
+		t.Fatal("转存后的副本必须进台账,供后续提链复用")
+	}
+}
+
+// 台账命中的副本:第二次提链只重取直链,不得再转存(也不消耗当日转存配额)。
+func TestGetDirectLinkReusesCopy(t *testing.T) {
+	var transfers int
+	var locatedAt string
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/share/transfer":
+			transfers++
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
+				{"to_fs_id": "999", "to": "/panrouter_tmp/a.bin"},
+			}}})
+		case "/rest/2.0/pcs/file":
+			locatedAt = r.URL.Query().Get("path")
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "urls": []map[string]any{
+				{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0},
+			}})
+		case "/api/filemanager":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	ref := driver.FileRef{FID: "111", Ext: map[string]string{"share_id": "12345", "uk": "67890", "sekey": "+sekey="}}
+	if _, err := d.GetDirectLink(context.Background(), cred(), ref); err != nil {
+		t.Fatalf("first GetDirectLink: %v", err)
+	}
+	dl, err := d.GetDirectLink(context.Background(), cred(), ref)
+	if err != nil {
+		t.Fatalf("second GetDirectLink: %v", err)
+	}
+	if transfers != 1 {
+		t.Fatalf("复用副本时不得再次转存, transfers=%d", transfers)
+	}
+	if locatedAt != "/panrouter_tmp/a.bin" {
+		t.Fatalf("复用必须按台账里的路径取链, got path=%q", locatedAt)
+	}
+	if !strings.Contains(dl.Cookie, "BDCLND=+sekey=") {
+		t.Fatalf("复用取链同样要带分享验证 Cookie, got %q", dl.Cookie)
+	}
+}
+
+// 过期副本在下次转存时被批量清扫;未过期的必须留着。
+func TestSweepCopiesDeletesExpired(t *testing.T) {
+	var deletedList string
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/share/transfer":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
+				{"to_fs_id": "999", "to": "/panrouter_tmp/new.bin"},
+			}}})
+		case "/rest/2.0/pcs/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "urls": []map[string]any{
+				{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0},
+			}})
+		case "/api/filemanager":
+			_ = r.ParseForm()
+			deletedList = r.Form.Get("filelist")
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	old := time.Now().Add(-2 * copyTTL)
+	d.rememberCopy(cred().Cookie, "OLD", "1", copyEntry{fsid: "888", path: "/panrouter_tmp/old.bin", at: old})
+	d.rememberCopy(cred().Cookie, "FRESH", "2", copyEntry{fsid: "889", path: "/panrouter_tmp/fresh.bin", at: time.Now()})
+
+	if _, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+		FID: "111", Ext: map[string]string{"share_id": "12345", "uk": "67890"},
+	}); err != nil {
+		t.Fatalf("GetDirectLink: %v", err)
+	}
+	if !strings.Contains(deletedList, "/panrouter_tmp/old.bin") {
+		t.Fatalf("过期副本必须被清扫, filelist=%q", deletedList)
+	}
+	if strings.Contains(deletedList, "/panrouter_tmp/fresh.bin") {
+		t.Fatalf("未过期副本不得删除, filelist=%q", deletedList)
+	}
+	if _, ok := d.reuseCopy(cred().Cookie, "OLD", "1"); ok {
+		t.Fatal("已清扫的副本必须从台账移除")
+	}
+	if _, ok := d.reuseCopy(cred().Cookie, "FRESH", "2"); !ok {
+		t.Fatal("未过期副本必须留在台账")
+	}
+}
+
+// 同一账号的清扫按 copySweepInterval 节流:连续提链不该每次都发删除请求。
+func TestSweepCopiesThrottled(t *testing.T) {
+	var deletes int
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/share/transfer":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
+				{"to_fs_id": "999", "to": "/panrouter_tmp/a.bin"},
+			}}})
+		case "/rest/2.0/pcs/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "urls": []map[string]any{
+				{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0},
+			}})
+		case "/api/filemanager":
+			deletes++
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	stale := time.Now().Add(-2 * copyTTL)
+	for i := 0; i < 3; i++ {
+		d.rememberCopy(cred().Cookie, "OLD"+itoa(i), "1", copyEntry{
+			fsid: "88" + itoa(i), path: "/panrouter_tmp/old" + itoa(i), at: stale,
+		})
+		if _, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+			FID: itoa(100 + i), Ext: map[string]string{"share_id": "12345", "uk": "67890"},
+		}); err != nil {
+			t.Fatalf("GetDirectLink %d: %v", i, err)
+		}
+	}
+	if deletes != 1 {
+		t.Fatalf("清扫必须节流:3 次提链只应删 1 次, got %d", deletes)
 	}
 }
 
@@ -352,13 +493,13 @@ func TestCookieHeader(t *testing.T) {
 // 已解码值必须原样返回(幂等),否则存量快照会被二次解码。
 func TestNormalizeSekey(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"%2Bsekey%3D", "+sekey="},        // verify 返回的编码形态 → 解码
-		{"+sekey=", "+sekey="},            // 已解码 → 原样(幂等)
-		{"abcDEF123", "abcDEF123"},        // 无 "%" 的普通 randsk → 原样
-		{"a%2Fb%2Bc%3D", "a/b+c="},        // 多个转义
-		{"%zz", "%zz"},                    // 非法转义 → 原样(不丢值)
-		{"", ""},                          // 空值
-		{"50%off", "50%off"},              // 含 "%" 但非合法转义序列 → 原样
+		{"%2Bsekey%3D", "+sekey="}, // verify 返回的编码形态 → 解码
+		{"+sekey=", "+sekey="},     // 已解码 → 原样(幂等)
+		{"abcDEF123", "abcDEF123"}, // 无 "%" 的普通 randsk → 原样
+		{"a%2Fb%2Bc%3D", "a/b+c="}, // 多个转义
+		{"%zz", "%zz"},             // 非法转义 → 原样(不丢值)
+		{"", ""},                   // 空值
+		{"50%off", "50%off"},       // 含 "%" 但非合法转义序列 → 原样
 	}
 	for _, c := range cases {
 		if got := normalizeSekey(c.in); got != c.want {
@@ -400,5 +541,65 @@ func TestTransferSurfacesShowMsg(t *testing.T) {
 	}
 	if !strings.Contains(de.UserHint, "提取码") {
 		t.Fatalf("show_msg 未回填到错误文案: %q", de.UserHint)
+	}
+}
+
+// 非 JSON 负载要按形态分流:HTML 是风控/验证页(冷却或换号可恢复),
+// 不能一律报「接口改版」把人引到不存在的接口变更上去。
+func TestClassifyBadBody(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want driver.Kind
+	}{
+		{"html verify page", "<!DOCTYPE html><html><body>安全验证</body></html>", driver.KindRiskControl},
+		{"html leading space", "\n  <html><body>verify</body></html>", driver.KindRiskControl},
+		{"garbage json", "errno=0&errmsg=ok", driver.KindInterfaceChanged},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			de := classifyBadBody(&httpx.Result{StatusCode: 200, Body: []byte(c.body)}, errors.New("decode"))
+			var e *driver.Error
+			if !errors.As(de, &e) || e.Kind != c.want {
+				t.Fatalf("kind=%v want %s (%v)", de, c.want, de)
+			}
+		})
+	}
+}
+
+// 响应片段里若混进凭据字段,必须被抹掉再进错误文案/日志。
+func TestSnippetRedactsCredentials(t *testing.T) {
+	got := snippet(`{"x":"BDUSS=secretvalue;STOKEN=tok123"} 以及 BDCLND=abc`)
+	if strings.Contains(got, "secretvalue") || strings.Contains(got, "tok123") || strings.Contains(got, "abc") {
+		t.Fatalf("凭据未被抹掉: %q", got)
+	}
+	if !strings.Contains(got, "***") {
+		t.Fatalf("抹除后应保留 *** 标记: %q", got)
+	}
+	// 超长片段按 rune 截断,不得切碎多字节字符。
+	long := strings.Repeat("百度", 200)
+	cut := snippet(long)
+	if len([]rune(cut)) != 120 {
+		t.Fatalf("snippet 应按 rune 截到 120, got %d", len([]rune(cut)))
+	}
+}
+
+// 空响应不能被当成「errno=0 成功」:旧实现会让调用方把没建成的目录当已建好。
+func TestEmptyBodyIsUpstreamError(t *testing.T) {
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			w.WriteHeader(http.StatusBadGateway)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	_, err := d.getBdstoken(context.Background(), cred(), false)
+	var de *driver.Error
+	if !errors.As(err, &de) || de.Kind != driver.KindUpstream {
+		t.Fatalf("空响应必须报 upstream, got %v", err)
+	}
+	if !strings.Contains(de.UserHint, "空响应") {
+		t.Fatalf("提示应说明是空响应: %q", de.UserHint)
 	}
 }

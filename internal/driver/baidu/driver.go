@@ -89,6 +89,16 @@ type Driver struct {
 	quotaMu  sync.Mutex
 	quotaDay map[string]string // 登录态指纹 → 记数日("2006-01-02")
 	quotaN   map[string]int    // 登录态指纹 → 当日已转存次数
+
+	// 转存副本台账:key = 登录态指纹|share_id|fsid。
+	//
+	// 百度对「转存完立刻删除」这种循环非常敏感——生产实证(2026-11-17)一小时
+	// 内约 20 次转存+删除后,账号被直接拉黑转存权限(/share/transfer 回
+	// errno=9013 hit black uid share transfer)。故副本不再用完即删:在 copyTTL
+	// 内复用(只重取直链,不再转存),过期后在下一次转存时批量清扫。
+	copyMu  sync.Mutex
+	copies  map[string]copyEntry // 台账:key = 登录态指纹|share_id|fsid
+	sweepAt map[string]time.Time // 登录态指纹 → 上次清扫时间(节流用)
 }
 
 func New(client *httpx.Client, base string) *Driver {
@@ -103,6 +113,8 @@ func New(client *httpx.Client, base string) *Driver {
 		bdstoken: map[string]string{},
 		quotaDay: map[string]string{},
 		quotaN:   map[string]int{},
+		copies:   map[string]copyEntry{},
+		sweepAt:  map[string]time.Time{},
 	}
 }
 
@@ -159,6 +171,16 @@ func classifyErrno(errno int, msg string) *driver.Error {
 			return driver.NewErr(driver.KindRiskControl, "百度要求安全验证,请稍后重试:"+msg, nil)
 		}
 		return driver.NewErr(driver.KindShareGone, "分享不存在或已被删除:"+msg, nil)
+	case 9013, 9012, 9014:
+		// 生产实证(2026-11-17):9013「hit black uid share transfer」= 百度把该
+		// 账号拉进了**转存黑名单**(高频「转存→删除」循环最容易触发,实测一小时
+		// 约 20 次即中招)。这不是能重试掉的错误:冷却账号、换号,并在提示里明确
+		// 告诉用户,而不是含糊地报「接口异常」。
+		hint := "百度已限制该账号转存(触发风控黑名单),请稍后重试或改用其他账号"
+		if msg != "" {
+			hint += ":" + msg
+		}
+		return driver.NewErr(driver.KindRiskControl, hint, nil)
 	case 111:
 		// 空间不足 / 文件数超限
 		return driver.NewErr(driver.KindUpstream, "百度网盘空间不足或转存受限:"+msg, nil)
@@ -234,12 +256,46 @@ func (d *Driver) call(ctx context.Context, method, rawURL string, form url.Value
 	if err != nil {
 		return nil, driver.NewErr(driver.KindUpstream, "百度网络请求失败", err)
 	}
-	if out != nil && len(res.Body) > 0 {
+	if out != nil {
+		if len(res.Body) == 0 {
+			// 旧实现把空响应当「解码成功」继续走:errno 零值 == 0,调用方会把
+			// 一次空回包当成功(例如把没建成的暂存目录当已建好)。
+			return res, driver.NewErr(driver.KindUpstream,
+				"百度返回空响应(HTTP "+itoa(res.StatusCode)+")", nil)
+		}
 		if err := json.Unmarshal(res.Body, out); err != nil {
-			return res, driver.NewErr(driver.KindInterfaceChanged, "百度响应不是合法 JSON,疑似接口改版", err)
+			return res, classifyBadBody(res, err)
 		}
 	}
 	return res, nil
+}
+
+// badBodyRe 抹掉响应片段里可能出现的凭据字段(响应体本不该带,但不赌)。
+var badBodyRe = regexp.MustCompile(`(?i)(BDUSS(?:_BFESS)?|STOKEN|PTOKEN|BAIDUID|BDCLND)=[^;&\s"']*`)
+
+// classifyBadBody 把「有响应但不是 JSON」的负载对上号。
+//
+// 生产实证(2026-11-17):百度在风控/验证态下会直接回一个 HTML 页(WAF 或安全
+// 验证页)。旧实现一律报 `interface_changed` —— 既触发「接口改版」高优告警,
+// 又把真实原因(风控,冷却/换账号即可恢复)藏起来,让人去查不存在的接口变更。
+// 按响应形态分流,并带上截断片段供排障。
+func classifyBadBody(res *httpx.Result, decodeErr error) error {
+	body := strings.TrimSpace(string(res.Body))
+	if strings.HasPrefix(body, "<") {
+		return driver.NewErr(driver.KindRiskControl,
+			"百度返回验证/风控页(HTTP "+itoa(res.StatusCode)+"),请稍后重试或换账号:"+snippet(body), decodeErr)
+	}
+	return driver.NewErr(driver.KindInterfaceChanged,
+		"百度响应不是合法 JSON,疑似接口改版:"+snippet(body), decodeErr)
+}
+
+// snippet 截断响应片段(按 rune 截,避免切碎多字节字符)并抹掉凭据字段。
+func snippet(body string) string {
+	r := []rune(badBodyRe.ReplaceAllString(body, "$1=***"))
+	if len(r) > 120 {
+		r = r[:120]
+	}
+	return string(r)
 }
 
 // mustOK 校验 errno。★ errno==0 必须显式返回 nil:classifyErrno 返回的是
