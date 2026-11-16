@@ -39,21 +39,40 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 
 	tmp := d.ensureTmpDir(ctx, cred)
 	if tmp != "" {
+		// 清扫丢到后台:它要现取 bdstoken + 列目录 + 批量删除,不该占用解析请求的
+		// 预算,也不该和用户自己的提链抢 pan 限频。放在转存之前、且两条路径共用:
+		// 重启后台账已空,只有后续的解析请求才会触发对账——只挂在转存路径上,
+		// 命中复用(最常见)就永远不会清理上次进程留下的孤儿副本。
+		d.sweepCopies(ctx, cred, tmp)
 		// 先查副本台账:命中且未过期就只重取直链,不再转存。
 		// 百度把「转存→立刻删除」的循环当刷量(生产实证 2026-11-17:一小时约
 		// 20 次即被拉进转存黑名单,errno=9013),复用副本是压掉转存次数最直接
 		// 的办法,同时也省掉当天的转存配额。
 		if e, ok := d.reuseCopy(cred.Cookie, shareID, ref.FID); ok {
-			if u, lerr := d.locateDownload(ctx, cred.Cookie, e.path); lerr == nil {
+			u, lerr := d.locateDownload(ctx, cred.Cookie, e.path)
+			if lerr == nil {
+				d.touchCopy(cred.Cookie, shareID, ref.FID)
 				return d.linkFrom(cookieHeader(cred.Cookie, e.sekey), u), nil
 			}
-			if token, terr := d.getBdstoken(ctx, cred, false); terr == nil {
-				if u, lerr := d.filemetasDlink(ctx, cred.Cookie, token, e.fsid); lerr == nil {
+			token, terr := d.getBdstoken(ctx, cred, false)
+			if terr == nil {
+				if u, lerr2 := d.filemetasDlink(ctx, cred.Cookie, token, e.fsid); lerr2 == nil {
+					d.touchCopy(cred.Cookie, shareID, ref.FID)
 					return d.linkFrom(cookieHeader(cred.Cookie, e.sekey), u), nil
+				} else {
+					lerr = lerr2
 				}
 			}
-			// 副本被外部删除,或两条取链路径同时失效:丢掉台账,重新转存。
-			d.forgetCopy(cred.Cookie, shareID, ref.FID)
+			// 只有「副本确实不存在」才丢台账重转:网络抖动/风控/接口异常时副本多半
+			// 还在,重转只会白烧一次配额、多一次刷量记录(黑名单风险),如实报错更稳。
+			if copyGone(lerr) {
+				d.forgetCopy(cred.Cookie, shareID, ref.FID)
+			} else {
+				if terr != nil {
+					return driver.DirectLink{}, terr
+				}
+				return driver.DirectLink{}, lerr
+			}
 		}
 		if err := d.takeTransferQuota(cred.Cookie); err != nil {
 			return driver.DirectLink{}, err
@@ -68,7 +87,6 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 		d.rememberCopy(cred.Cookie, shareID, ref.FID, copyEntry{
 			fsid: newFsid, path: newPath, sekey: sekey, at: time.Now(),
 		})
-		d.sweepCopies(ctx, cred)
 		if u, err := d.locateDownload(ctx, cred.Cookie, newPath); err == nil {
 			return d.linkFrom(cookieHeader(cred.Cookie, sekey), u), nil
 		} else {
@@ -360,8 +378,13 @@ func (d *Driver) filemetasDlink(ctx context.Context, cookie, token, fsid string)
 // 在别的账号/裸 Python 上都能正常转存。所以副本改为:在 copyTTL 内复用
 // (只重取直链,不消耗转存配额),过期后合并成一次批量删除。
 
-// copyTTL 副本保留时长:与直链缓存同期,过期即可安全删除。
-const copyTTL = linkTTL
+// copyTTL 是副本的**闲置**超时,不是「转存后的绝对寿命」:每次复用都会续期。
+//
+// ★ 必须显著大于 linkTTL(45 分钟):直链缓存到期会重新调 GetDirectLink,若副本
+// 按「转存时刻 + 45 分钟」判过期,续签请求必然正好踩在过期边界上重新转存,复用
+// 路径形同虚设(仍然每个直链周期转存一次)。4 小时覆盖常见会话时长,又不至于把
+// 转存副本长期占着用户网盘空间。
+const copyTTL = 4 * time.Hour
 
 // maxCopiesPerAccount 单账号台账上界:防超长分享把暂存目录撑爆,超出按最旧优先清。
 const maxCopiesPerAccount = 80
@@ -369,12 +392,22 @@ const maxCopiesPerAccount = 80
 // copySweepInterval 同账号清扫节流:过期副本攒着一起删,避免又退化成一链一删。
 const copySweepInterval = 10 * time.Minute
 
+// copySweepBudget 后台清扫的独立预算:清扫不跟随任何解析请求的生命周期。
+const copySweepBudget = 30 * time.Second
+
 // copyEntry 是一条已转存副本的台账项。
 type copyEntry struct {
 	fsid  string    // 转存后的 fs_id(filemetas 取直链用)
 	path  string    // 转存后的完整路径(locatedownload 取直链 / 删除用)
 	sekey string    // 分享验证标识:重取直链时 Cookie 要带同一个 BDCLND
-	at    time.Time // 转存时间
+	at    time.Time // 最近使用时间(转存或复用命中时刷新)
+}
+
+// sweepItem 是一条待清扫的台账项(台账键 + 副本路径 + 快照时的 at)。
+type sweepItem struct {
+	key  string
+	path string
+	at   time.Time
 }
 
 // copyKey 台账键:同账号下按「分享 + 文件」区分,不同分享的同名文件不会串。
@@ -382,7 +415,7 @@ func copyKey(cookie, shareID, fsid string) string {
 	return fingerprint(cookie) + "|" + shareID + "|" + fsid
 }
 
-// reuseCopy 查台账;命中且未过期返回副本,调用方只重取直链即可。
+// reuseCopy 查台账;命中且未闲置超时返回副本,调用方只重取直链即可。
 func (d *Driver) reuseCopy(cookie, shareID, fsid string) (copyEntry, bool) {
 	d.copyMu.Lock()
 	e, ok := d.copies[copyKey(cookie, shareID, fsid)]
@@ -399,16 +432,72 @@ func (d *Driver) rememberCopy(cookie, shareID, fsid string, e copyEntry) {
 	d.copyMu.Unlock()
 }
 
+// touchCopy 刷新最近使用时间。不刷新的话,天天在用的副本也会在转存 4 小时后被
+// 判闲置 —— 然后下次请求再转存一次,正是要压掉的刷量。
+func (d *Driver) touchCopy(cookie, shareID, fsid string) {
+	k := copyKey(cookie, shareID, fsid)
+	d.copyMu.Lock()
+	if e, ok := d.copies[k]; ok {
+		e.at = time.Now()
+		d.copies[k] = e
+	}
+	d.copyMu.Unlock()
+}
+
 func (d *Driver) forgetCopy(cookie, shareID, fsid string) {
 	d.copyMu.Lock()
 	delete(d.copies, copyKey(cookie, shareID, fsid))
 	d.copyMu.Unlock()
 }
 
-// sweepCopies 把过期/超量的副本攒成一次批量删除(同账号至多每 copySweepInterval
-// 一次)。失败只忽略:下次还会再扫,副本本身不影响功能。
-func (d *Driver) sweepCopies(ctx context.Context, cred *driver.Credential) {
-	if cred == nil || cred.Cookie == "" {
+// dropCopies 批量移除台账项(删除成功/确认远端不存在后调用)。
+//
+// 按 at 做「比较并删除」:清扫在后台跑,期间同一个键可能已经因为复用失败被重转
+// 成了一份新副本并重新入账 —— 盲删会把新副本的记录抹掉,留下无人认领的孤儿。
+// at 不同就说明台账已被更新,保留。
+func (d *Driver) dropCopies(items []sweepItem) {
+	if len(items) == 0 {
+		return
+	}
+	d.copyMu.Lock()
+	for _, it := range items {
+		if e, ok := d.copies[it.key]; ok && e.at.Equal(it.at) {
+			delete(d.copies, it.key)
+		}
+	}
+	d.copyMu.Unlock()
+}
+
+// copyGone 判断复用失败是否属于「副本确实不在了」。只有这种失败才值得丢台账
+// 重新转存;网络抖动/风控/接口异常都保留台账,下次继续尝试复用。
+func copyGone(err error) bool {
+	var de *driver.Error
+	if !errors.As(err, &de) {
+		return false
+	}
+	switch de.Kind {
+	case driver.KindNotFound, driver.KindShareGone:
+		return true
+	}
+	// locatedownload/filemetas 对「文件已不在」的 errno 没有实证(可能复用
+	// errno=2 参数错误),按文案兜底识别。宁可多认一次:漏认会让一个已删副本把
+	// 台账永久钉住 —— 每次提链都失败,却永远不重转。
+	h := de.UserHint
+	return strings.Contains(h, "不存在") || strings.Contains(h, "已删除")
+}
+
+// sweepCopies 在后台清扫过期副本,同账号至多每 copySweepInterval 一次。
+//
+// 三个约束决定了这个形状:
+//  1. **不能占请求路径**:清扫要现取 bdstoken、列目录、发批量删除,和用户的提链
+//     抢同一份限频与 90s 预算,放在 GetDirectLink 里等于给每次解析加尾延迟。
+//  2. **远端目录才是真源**:台账在内存里,进程一重启就空了(每次发版都重启)。
+//     只看台账,遗留副本会永远留在用户网盘里——转存用 ondup=newcopy,每重转一份
+//     就多一份,孤儿无限累积并持续吃配额。
+//  3. **删除成功才丢台账**:删失败还提前忘掉台账,云端副本就失去唯一记录,以后
+//     没人会再清它。仅「超上限」的台账项例外——内存必须有界。
+func (d *Driver) sweepCopies(ctx context.Context, cred *driver.Credential, dir string) {
+	if cred == nil || cred.Cookie == "" || dir == "" {
 		return
 	}
 	fp := fingerprint(cred.Cookie)
@@ -421,6 +510,8 @@ func (d *Driver) sweepCopies(ctx context.Context, cred *driver.Credential) {
 		d.copyMu.Unlock()
 		return
 	}
+	// 先占位再异步执行:并发请求里只有一个会真正发起清扫;失败也按间隔重试,
+	// 不会因为一次失败变成每个请求都扫。
 	d.sweepAt[fp] = now
 	prefix := fp + "|"
 	keys := make([]string, 0, len(d.copies))
@@ -429,45 +520,142 @@ func (d *Driver) sweepCopies(ctx context.Context, cred *driver.Credential) {
 			keys = append(keys, k)
 		}
 	}
-	// 最旧的排前面:先删过期,超量时补刀最旧的。
+	// 最旧的排前面:先删闲置超时的,超上限时补刀最旧的。
 	sort.Slice(keys, func(i, j int) bool { return d.copies[keys[i]].at.Before(d.copies[keys[j]].at) })
 	overflow := len(keys) - maxCopiesPerAccount
-	var doomed []copyEntry
+	var forced, idle []sweepItem
+	live := make(map[string]struct{}, len(keys))
 	for i, k := range keys {
 		e := d.copies[k]
-		if now.Sub(e.at) > copyTTL || i < overflow {
-			doomed = append(doomed, e)
-			delete(d.copies, k)
+		switch {
+		case i < overflow:
+			forced = append(forced, sweepItem{key: k, path: e.path, at: e.at})
+		case now.Sub(e.at) > copyTTL:
+			idle = append(idle, sweepItem{key: k, path: e.path, at: e.at})
+		default:
+			// 仍在使用的副本:即使远端 mtime 很旧也不许删(复用只重取直链,
+			// 不会更新文件 mtime,靠 at 判活)。
+			if e.path != "" {
+				live[e.path] = struct{}{}
+			}
 		}
 	}
 	d.copyMu.Unlock()
-	if len(doomed) == 0 {
-		return
-	}
-	paths := make([]string, 0, len(doomed))
-	for _, e := range doomed {
-		if e.path != "" {
-			paths = append(paths, e.path)
+
+	d.sweepWG.Add(1)
+	go func() {
+		defer d.sweepWG.Done()
+		// 后台 goroutine 的 panic 不能掀翻进程。
+		defer func() { _ = recover() }()
+		cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), copySweepBudget)
+		defer cancel()
+		token, err := d.getBdstoken(cleanCtx, cred, false)
+		if err != nil {
+			d.dropCopies(forced)
+			return
 		}
-	}
-	d.deletePaths(ctx, cred, paths)
+		entries, lerr := d.listDir(cleanCtx, cred.Cookie, dir)
+		if lerr == nil {
+			present := make(map[string]struct{}, len(entries))
+			for _, it := range entries {
+				present[it.Path] = struct{}{}
+			}
+			// 远端已不存在的闲置台账项:直接清台账,不必再发删除。列表即使被
+			// 截断也无害——看不见的项照样会按路径发删除,删除成功才丢台账。
+			keep := idle[:0]
+			var gone []sweepItem
+			for _, it := range idle {
+				if _, ok := present[it.path]; ok {
+					keep = append(keep, it)
+				} else {
+					gone = append(gone, it)
+				}
+			}
+			idle = keep
+			d.dropCopies(gone)
+		}
+		paths := make([]string, 0, len(forced)+len(idle)+len(entries))
+		seen := make(map[string]struct{}, len(forced)+len(idle))
+		add := func(p string) {
+			if p == "" {
+				return
+			}
+			if _, ok := live[p]; ok {
+				return
+			}
+			if _, ok := seen[p]; ok {
+				return
+			}
+			seen[p] = struct{}{}
+			paths = append(paths, p)
+		}
+		for _, it := range forced {
+			add(it.path)
+		}
+		for _, it := range idle {
+			add(it.path)
+		}
+		if lerr == nil {
+			// 台账外的遗留副本(重启/换 Cookie 造成):按远端 mtime 兜底清理。
+			cutoff := time.Now().Add(-copyTTL)
+			for _, it := range entries {
+				if it.IsDir != 0 || it.ServerMtime <= 0 {
+					continue
+				}
+				if time.Unix(it.ServerMtime, 0).Before(cutoff) {
+					add(it.Path)
+				}
+			}
+		}
+		if len(paths) == 0 {
+			d.dropCopies(forced)
+			return
+		}
+		if derr := d.deletePaths(cleanCtx, cred.Cookie, token, paths); derr != nil {
+			// 删除失败:只丢超上限的台账(保证内存有界),其余留着下次重试。
+			d.dropCopies(forced)
+			return
+		}
+		d.dropCopies(append(forced, idle...))
+	}()
 }
 
-// deletePaths 批量删除暂存目录内的副本。用独立超时预算:调用方请求被取消
-// 也要把已拿到直链的副本清掉(否则暂存目录会越积越大)。
-func (d *Driver) deletePaths(ctx context.Context, cred *driver.Credential, paths []string) {
-	if len(paths) == 0 {
-		return
+// dirEntry 是 api/list 的条目子集:清理只需要路径、类型与服务器时间。
+type dirEntry struct {
+	Path        string `json:"path"`
+	IsDir       int    `json:"isdir"`
+	ServerMtime int64  `json:"server_mtime"`
+}
+
+// dirListNum 暂存目录单页条数(台账上限 80,单页足够;对账时用它判断是否被截断)。
+const dirListNum = 1000
+
+// listDir 列出暂存目录内容(清理的远端真源)。
+func (d *Driver) listDir(ctx context.Context, cookie, dir string) ([]dirEntry, error) {
+	u := d.base + "/api/list?clienttype=0&app_id=" + appID +
+		"&web=1&order=time&desc=1&dir=" + url.QueryEscape(dir) + "&num=" + itoa(dirListNum) + "&page=1"
+	var out struct {
+		Errno  int        `json:"errno"`
+		ErrMsg string     `json:"errmsg"`
+		List   []dirEntry `json:"list"`
 	}
-	cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
-	token, err := d.getBdstoken(cleanCtx, cred, false)
-	if err != nil {
-		return
+	if _, err := d.call(ctx, "GET", u, nil, map[string]string{"cookie": cookie}, &out); err != nil {
+		return nil, err
+	}
+	if err := mustOK(out.Errno, out.ErrMsg); err != nil {
+		return nil, err
+	}
+	return out.List, nil
+}
+
+// deletePaths 批量删除暂存目录内的副本,返回本次删除是否被接受。
+func (d *Driver) deletePaths(ctx context.Context, cookie, token string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
 	}
 	raw, err := json.Marshal(paths)
 	if err != nil {
-		return
+		return err
 	}
 	form := url.Values{}
 	form.Set("filelist", string(raw))
@@ -477,7 +665,10 @@ func (d *Driver) deletePaths(ctx context.Context, cred *driver.Credential, paths
 		Errno  int    `json:"errno"`
 		ErrMsg string `json:"errmsg"`
 	}
-	_, _ = d.call(cleanCtx, "POST", u, form, map[string]string{
-		"cookie": cred.Cookie,
-	}, &out)
+	if _, err := d.call(ctx, "POST", u, form, map[string]string{
+		"cookie": cookie,
+	}, &out); err != nil {
+		return err
+	}
+	return mustOK(out.Errno, out.ErrMsg)
 }

@@ -28,6 +28,32 @@ func newTestDriver(t *testing.T, h http.Handler) *Driver {
 
 func cred() *driver.Credential { return &driver.Credential{Cookie: "BDUSS=abc; STOKEN=def"} }
 
+// waitSweep 等后台清扫结束:清扫不再是同步调用,断言前必须等它跑完,
+// 否则会与 handler 闭包跨 goroutine 读写(数据竞争)。
+func (d *Driver) waitSweep() { d.sweepWG.Wait() }
+
+// ledgerHas 直接查台账(不经 reuseCopy 的闲置超时判定)。
+func (d *Driver) ledgerHas(cookie, shareID, fsid string) bool {
+	d.copyMu.Lock()
+	defer d.copyMu.Unlock()
+	_, ok := d.copies[copyKey(cookie, shareID, fsid)]
+	return ok
+}
+
+// ledgerAt 读台账里的最近使用时间(测试用)。
+func (d *Driver) ledgerAt(cookie, shareID, fsid string) time.Time {
+	d.copyMu.Lock()
+	defer d.copyMu.Unlock()
+	return d.copies[copyKey(cookie, shareID, fsid)].at
+}
+
+// ledgerFsid 读台账里的副本 fs_id(测试用)。
+func (d *Driver) ledgerFsid(cookie, shareID, fsid string) string {
+	d.copyMu.Lock()
+	defer d.copyMu.Unlock()
+	return d.copies[copyKey(cookie, shareID, fsid)].fsid
+}
+
 // 新旧 surl 格式都必须识别:新格式含 `_`/`-`(base64url),旧实现会误报 STOKEN 缺失。
 func TestParseShareFormats(t *testing.T) {
 	cases := []struct {
@@ -211,6 +237,8 @@ func TestGetDirectLinkTransferChain(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
 		case "/share/transfer":
 			_ = r.ParseForm()
 			transferred = r.Form.Get("fsidlist") == `["111"]` && r.Form.Get("path") == "/panrouter_tmp"
@@ -258,6 +286,7 @@ func TestGetDirectLinkTransferChain(t *testing.T) {
 	if dl.UA != NetdiskUA || !strings.Contains(dl.Cookie, "BDUSS=abc") {
 		t.Fatalf("link constraints: ua=%q cookie=%q", dl.UA, dl.Cookie)
 	}
+	d.waitSweep()
 	if deleted {
 		t.Fatal("首次提链不得立刻删除副本:高频「转存→删除」会被百度拉黑转存权限(errno=9013)")
 	}
@@ -276,6 +305,8 @@ func TestGetDirectLinkReusesCopy(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
 		case "/share/transfer":
 			transfers++
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
@@ -297,6 +328,7 @@ func TestGetDirectLinkReusesCopy(t *testing.T) {
 	if _, err := d.GetDirectLink(context.Background(), cred(), ref); err != nil {
 		t.Fatalf("first GetDirectLink: %v", err)
 	}
+	d.waitSweep()
 	dl, err := d.GetDirectLink(context.Background(), cred(), ref)
 	if err != nil {
 		t.Fatalf("second GetDirectLink: %v", err)
@@ -312,15 +344,21 @@ func TestGetDirectLinkReusesCopy(t *testing.T) {
 	}
 }
 
-// 过期副本在下次转存时被批量清扫;未过期的必须留着。
+// 清扫以远端目录为准:闲置超时的批量删,未过期的、仍在复用的一律留着。
 func TestSweepCopiesDeletesExpired(t *testing.T) {
 	var deletedList string
+	oldMtime := time.Now().Add(-2 * copyTTL).Unix()
 	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/gettemplatevariable":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{
+				{"path": "/panrouter_tmp/old.bin", "server_mtime": oldMtime},
+				{"path": "/panrouter_tmp/fresh.bin", "server_mtime": time.Now().Unix()},
+			}})
 		case "/share/transfer":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
 				{"to_fs_id": "999", "to": "/panrouter_tmp/new.bin"},
@@ -347,29 +385,175 @@ func TestSweepCopiesDeletesExpired(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("GetDirectLink: %v", err)
 	}
+	d.waitSweep()
 	if !strings.Contains(deletedList, "/panrouter_tmp/old.bin") {
-		t.Fatalf("过期副本必须被清扫, filelist=%q", deletedList)
+		t.Fatalf("闲置超时副本必须被清扫, filelist=%q", deletedList)
 	}
 	if strings.Contains(deletedList, "/panrouter_tmp/fresh.bin") {
 		t.Fatalf("未过期副本不得删除, filelist=%q", deletedList)
 	}
-	if _, ok := d.reuseCopy(cred().Cookie, "OLD", "1"); ok {
+	if d.ledgerHas(cred().Cookie, "OLD", "1") {
 		t.Fatal("已清扫的副本必须从台账移除")
 	}
-	if _, ok := d.reuseCopy(cred().Cookie, "FRESH", "2"); !ok {
+	if !d.ledgerHas(cred().Cookie, "FRESH", "2") {
 		t.Fatal("未过期副本必须留在台账")
 	}
 }
 
-// 同一账号的清扫按 copySweepInterval 节流:连续提链不该每次都发删除请求。
-func TestSweepCopiesThrottled(t *testing.T) {
-	var deletes int
+// 重启/换 Cookie 后台账是空的:远端残留副本(台账外)也必须按 mtime 清掉,
+// 否则每次发版都会在用户网盘里留下一份永不清理的副本。
+func TestSweepCopiesDeletesRemoteOrphans(t *testing.T) {
+	var deletedList string
+	oldMtime := time.Now().Add(-2 * copyTTL).Unix()
 	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/gettemplatevariable":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{
+				{"path": "/panrouter_tmp/leftover.bin", "server_mtime": oldMtime},
+				{"path": "/panrouter_tmp/just-now.bin", "server_mtime": time.Now().Unix()},
+			}})
+		case "/share/transfer":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
+				{"to_fs_id": "999", "to": "/panrouter_tmp/new.bin"},
+			}}})
+		case "/rest/2.0/pcs/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "urls": []map[string]any{
+				{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0},
+			}})
+		case "/api/filemanager":
+			_ = r.ParseForm()
+			deletedList = r.Form.Get("filelist")
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	if _, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+		FID: "111", Ext: map[string]string{"share_id": "12345", "uk": "67890"},
+	}); err != nil {
+		t.Fatalf("GetDirectLink: %v", err)
+	}
+	d.waitSweep()
+	if !strings.Contains(deletedList, "/panrouter_tmp/leftover.bin") {
+		t.Fatalf("台账外的陈旧副本必须清掉(否则重启后无人清理), filelist=%q", deletedList)
+	}
+	if strings.Contains(deletedList, "/panrouter_tmp/just-now.bin") {
+		t.Fatalf("刚写入的副本可能属于在途转存,不得删除, filelist=%q", deletedList)
+	}
+}
+
+// 复用中(at 刷新过)的副本:即使远端 mtime 很旧也不得删——复用只重取直链,
+// 不会更新文件 mtime,判活只能靠台账的 at。
+func TestSweepCopiesKeepsLiveCopy(t *testing.T) {
+	var deletedList string
+	oldMtime := time.Now().Add(-2 * copyTTL).Unix()
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{
+				{"path": "/panrouter_tmp/hot.bin", "server_mtime": oldMtime},
+			}})
+		case "/share/transfer":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
+				{"to_fs_id": "999", "to": "/panrouter_tmp/new.bin"},
+			}}})
+		case "/rest/2.0/pcs/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "urls": []map[string]any{
+				{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0},
+			}})
+		case "/api/filemanager":
+			_ = r.ParseForm()
+			deletedList = r.Form.Get("filelist")
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	// at 是刚刚(仍在复用),远端 mtime 却是 8 小时前:必须按 at 判活。
+	d.rememberCopy(cred().Cookie, "HOT", "1", copyEntry{
+		fsid: "777", path: "/panrouter_tmp/hot.bin", at: time.Now(),
+	})
+	if _, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+		FID: "111", Ext: map[string]string{"share_id": "12345", "uk": "67890"},
+	}); err != nil {
+		t.Fatalf("GetDirectLink: %v", err)
+	}
+	d.waitSweep()
+	if strings.Contains(deletedList, "/panrouter_tmp/hot.bin") {
+		t.Fatalf("仍在复用的副本不得删除, filelist=%q", deletedList)
+	}
+}
+
+// 删除失败不得提前丢台账:丢了就再也没人清那份云端副本了(下次扫到要能重试)。
+func TestSweepCopiesKeepsLedgerOnDeleteFailure(t *testing.T) {
+	oldMtime := time.Now().Add(-2 * copyTTL).Unix()
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{
+				{"path": "/panrouter_tmp/old.bin", "server_mtime": oldMtime},
+			}})
+		case "/share/transfer":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
+				{"to_fs_id": "999", "to": "/panrouter_tmp/new.bin"},
+			}}})
+		case "/rest/2.0/pcs/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "urls": []map[string]any{
+				{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0},
+			}})
+		case "/api/filemanager":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 31064, "errmsg": "delete failed"})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	d.rememberCopy(cred().Cookie, "OLD", "1", copyEntry{
+		fsid: "888", path: "/panrouter_tmp/old.bin", at: time.Now().Add(-2 * copyTTL),
+	})
+	if _, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+		FID: "111", Ext: map[string]string{"share_id": "12345", "uk": "67890"},
+	}); err != nil {
+		t.Fatalf("GetDirectLink: %v", err)
+	}
+	d.waitSweep()
+	if !d.ledgerHas(cred().Cookie, "OLD", "1") {
+		t.Fatal("删除失败时不得丢台账,否则云端副本永远无人清理")
+	}
+}
+
+// 同一账号的清扫按 copySweepInterval 节流:连续提链不该每次都发删除请求。
+func TestSweepCopiesThrottled(t *testing.T) {
+	var deletes int
+	stale := time.Now().Add(-2 * copyTTL).Unix()
+	items := make([]map[string]any, 0, 3)
+	for i := 0; i < 3; i++ {
+		items = append(items, map[string]any{
+			"path": "/panrouter_tmp/old" + itoa(i), "server_mtime": stale,
+		})
+	}
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": items})
 		case "/share/transfer":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
 				{"to_fs_id": "999", "to": "/panrouter_tmp/a.bin"},
@@ -386,19 +570,150 @@ func TestSweepCopiesThrottled(t *testing.T) {
 		}
 	}))
 
-	stale := time.Now().Add(-2 * copyTTL)
 	for i := 0; i < 3; i++ {
 		d.rememberCopy(cred().Cookie, "OLD"+itoa(i), "1", copyEntry{
-			fsid: "88" + itoa(i), path: "/panrouter_tmp/old" + itoa(i), at: stale,
+			fsid: "88" + itoa(i), path: "/panrouter_tmp/old" + itoa(i), at: time.Now().Add(-2 * copyTTL),
 		})
 		if _, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
 			FID: itoa(100 + i), Ext: map[string]string{"share_id": "12345", "uk": "67890"},
 		}); err != nil {
 			t.Fatalf("GetDirectLink %d: %v", i, err)
 		}
+		d.waitSweep()
 	}
 	if deletes != 1 {
 		t.Fatalf("清扫必须节流:3 次提链只应删 1 次, got %d", deletes)
+	}
+}
+
+// 复用命中要刷新闲置计时:否则天天在用的副本也会在 4 小时后被判过期并重转,
+// 等于每个直链周期又转存一次(正是要压掉的刷量)。
+func TestReuseCopyRefreshesIdleTimer(t *testing.T) {
+	var transfers int
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/share/transfer":
+			transfers++
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/rest/2.0/pcs/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "urls": []map[string]any{
+				{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0},
+			}})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	d.rememberCopy(cred().Cookie, "12345", "111", copyEntry{
+		fsid: "999", path: "/panrouter_tmp/a.bin", at: time.Now().Add(-3 * time.Hour),
+	})
+	if _, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+		FID: "111", Ext: map[string]string{"share_id": "12345", "uk": "67890"},
+	}); err != nil {
+		t.Fatalf("GetDirectLink: %v", err)
+	}
+	if transfers != 0 {
+		t.Fatalf("副本未闲置超时,不得重转, transfers=%d", transfers)
+	}
+	if at := d.ledgerAt(cred().Cookie, "12345", "111"); time.Since(at) > time.Minute {
+		t.Fatalf("复用命中必须刷新 at(闲置计时), at=%v", at)
+	}
+}
+
+// 复用失败若是网络/风控等瞬时问题:副本多半还在,不得丢台账重转(那是白烧配额
+// 加刷量记录),而应如实报错、保留台账。
+func TestReuseTransientFailureKeepsCopy(t *testing.T) {
+	var transfers int
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/share/transfer":
+			transfers++
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/rest/2.0/pcs/file":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": -1, "errmsg": "psign invalid"})
+		case "/api/filemetas":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": -1, "errmsg": "service busy"})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	d.rememberCopy(cred().Cookie, "12345", "111", copyEntry{
+		fsid: "999", path: "/panrouter_tmp/a.bin", at: time.Now(),
+	})
+	_, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+		FID: "111", Ext: map[string]string{"share_id": "12345", "uk": "67890"},
+	})
+	if err == nil {
+		t.Fatal("两条取链路径都失败时必须如实报错")
+	}
+	d.waitSweep()
+	if transfers != 0 {
+		t.Fatalf("瞬时失败不得重新转存(刷量/配额风险), transfers=%d", transfers)
+	}
+	if !d.ledgerHas(cred().Cookie, "12345", "111") {
+		t.Fatal("瞬时失败不得丢台账,否则下次还得重转")
+	}
+}
+
+// 副本确实不在了(百度回「文件不存在」):必须丢台账重转,否则该文件永远提不出链。
+func TestReuseGoneCopyRetransfers(t *testing.T) {
+	var transfers, locates int
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/gettemplatevariable":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
+		case "/api/create":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/api/filemetas":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": -9, "errmsg": "file not found"})
+		case "/rest/2.0/pcs/file":
+			locates++
+			if locates == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{"errno": -9, "errmsg": "file not found"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "urls": []map[string]any{
+				{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0},
+			}})
+		case "/share/transfer":
+			transfers++
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
+				{"to_fs_id": "999", "to": "/panrouter_tmp/a.bin"},
+			}}})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+
+	d.rememberCopy(cred().Cookie, "12345", "111", copyEntry{
+		fsid: "888", path: "/panrouter_tmp/gone.bin", at: time.Now(),
+	})
+	if _, err := d.GetDirectLink(context.Background(), cred(), driver.FileRef{
+		FID: "111", Ext: map[string]string{"share_id": "12345", "uk": "67890"},
+	}); err != nil {
+		t.Fatalf("副本已不存在时应重转成功: %v", err)
+	}
+	d.waitSweep()
+	if transfers != 1 {
+		t.Fatalf("副本确认不存在必须重转一次, transfers=%d", transfers)
+	}
+	if got := d.ledgerFsid(cred().Cookie, "12345", "111"); got != "999" {
+		t.Fatalf("重转后台账必须换成新副本 fs_id, got %q", got)
 	}
 }
 
@@ -411,6 +726,8 @@ func TestGetDirectLinkFallsBackToFilemetas(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
 		case "/share/transfer":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
 				{"to_fs_id": "999", "to": "/panrouter_tmp/a.bin"},
@@ -497,6 +814,7 @@ func TestNormalizeSekey(t *testing.T) {
 		{"+sekey=", "+sekey="},     // 已解码 → 原样(幂等)
 		{"abcDEF123", "abcDEF123"}, // 无 "%" 的普通 randsk → 原样
 		{"a%2Fb%2Bc%3D", "a/b+c="}, // 多个转义
+		{"a+b%2Bc", "a+b+c"},       // 字面 "+" 必须保留(QueryUnescape 会解成空格)
 		{"%zz", "%zz"},             // 非法转义 → 原样(不丢值)
 		{"", ""},                   // 空值
 		{"50%off", "50%off"},       // 含 "%" 但非合法转义序列 → 原样
@@ -524,6 +842,8 @@ func TestTransferSurfacesShowMsg(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"errno": 200025, "errmsg": "", "show_msg": "提取码输入错误,请重试",
 			})
+		case "/api/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
@@ -532,6 +852,7 @@ func TestTransferSurfacesShowMsg(t *testing.T) {
 		FID: "111",
 		Ext: map[string]string{"share_id": "12345", "uk": "67890", "sekey": "+sekey="},
 	})
+	d.waitSweep()
 	var de *driver.Error
 	if !errors.As(err, &de) {
 		t.Fatalf("want driver.Error, got %v", err)

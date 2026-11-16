@@ -99,6 +99,11 @@ type Driver struct {
 	copyMu  sync.Mutex
 	copies  map[string]copyEntry // 台账:key = 登录态指纹|share_id|fsid
 	sweepAt map[string]time.Time // 登录态指纹 → 上次清扫时间(节流用)
+
+	// sweepWG 只给测试用:清扫在后台 goroutine 里跑,用例需要确定性地等它结束,
+	// 否则断言与 handler 闭包会跨测试读写(数据竞争 + 误报)。生产路径只做
+	// Add/Done 配对,不阻塞。
+	sweepWG sync.WaitGroup
 }
 
 func New(client *httpx.Client, base string) *Driver {
@@ -273,6 +278,10 @@ func (d *Driver) call(ctx context.Context, method, rawURL string, form url.Value
 // badBodyRe 抹掉响应片段里可能出现的凭据字段(响应体本不该带,但不赌)。
 var badBodyRe = regexp.MustCompile(`(?i)(BDUSS(?:_BFESS)?|STOKEN|PTOKEN|BAIDUID|BDCLND)=[^;&\s"']*`)
 
+// snippetRawLimit 是跑正则前的原始字节上限:够露出错误页特征,又不会让
+// 几 MB 的风控页整页过一遍正则。
+const snippetRawLimit = 512
+
 // classifyBadBody 把「有响应但不是 JSON」的负载对上号。
 //
 // 生产实证(2026-11-17):百度在风控/验证态下会直接回一个 HTML 页(WAF 或安全
@@ -291,6 +300,11 @@ func classifyBadBody(res *httpx.Result, decodeErr error) error {
 
 // snippet 截断响应片段(按 rune 截,避免切碎多字节字符)并抹掉凭据字段。
 func snippet(body string) string {
+	// 先按字节粗截再跑正则:风控/验证页可能是几 MB 的 HTML,对全文做正则既慢
+	// 又没必要。截断点即便落在多字节字符中间,也只影响片段里的一个替换符。
+	if len(body) > snippetRawLimit {
+		body = body[:snippetRawLimit]
+	}
 	r := []rune(badBodyRe.ReplaceAllString(body, "$1=***"))
 	if len(r) > 120 {
 		r = r[:120]

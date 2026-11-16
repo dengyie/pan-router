@@ -119,11 +119,14 @@ func (d *Driver) verify(ctx context.Context, surl, pwd string, cred *driver.Cred
 //
 // 幂等:已解码值(标准 base64 字母表,不含 "%")原样返回,因此对存量快照里
 // 存的编码形态也安全(在读取处调用即可自愈)。
+//
+// 用 PathUnescape 而不是 QueryUnescape:randsk 是 JSON 字段(不是表单值),
+// 其中出现的 `+` 就是字面加号;QueryUnescape 会把它解成空格,把 sekey 改坏。
 func normalizeSekey(sekey string) string {
 	if !strings.Contains(sekey, "%") {
 		return sekey
 	}
-	if dec, err := url.QueryUnescape(sekey); err == nil && dec != sekey {
+	if dec, err := url.PathUnescape(sekey); err == nil && dec != sekey {
 		return dec
 	}
 	return sekey
