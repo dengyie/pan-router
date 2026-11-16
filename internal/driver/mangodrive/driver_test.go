@@ -403,6 +403,57 @@ func TestListStopsWhenTotalReached(t *testing.T) {
 	}
 }
 
+// TestListFetchesRemainingPagesConcurrently 锁住大目录翻页的并发优化:
+// 已知 total 时剩余页必须并行抓取(隧道单次往返实测 ~3.2s,602 文件 4 页串行
+// 要 12.9s),且拼接顺序必须保持页序。用峰值并发断言而不是耗时断言,避免 CI
+// 机器快慢导致 flaky。
+func TestListFetchesRemainingPagesConcurrently(t *testing.T) {
+	const totalFiles = 602 // 4 页:200×3+2
+	var inflight, peak int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		cur := atomic.AddInt64(&inflight, 1)
+		for {
+			p := atomic.LoadInt64(&peak)
+			if cur <= p || atomic.CompareAndSwapInt64(&peak, p, cur) {
+				break
+			}
+		}
+		defer atomic.AddInt64(&inflight, -1)
+		time.Sleep(20 * time.Millisecond) // 放大并发窗口
+		page, _ := in["page"].(float64)
+		start := (int(page) - 1) * listPageSize
+		end := start + listPageSize
+		if end > totalFiles {
+			end = totalFiles
+		}
+		var items []string
+		for i := start; i < end; i++ {
+			items = append(items, `{"name":"f`+strconv.Itoa(i)+`","is_dir":false,"size":1}`)
+		}
+		_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"content":[` +
+			strings.Join(items, ",") + `],"total":602}}`))
+	}))
+	defer srv.Close()
+	api := NewAPI(newClient(t), srv.URL, "tok-1")
+	objs, err := api.List(context.Background(), "/Pool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != totalFiles {
+		t.Fatalf("got %d 条 want %d", len(objs), totalFiles)
+	}
+	if peak < 2 {
+		t.Fatalf("剩余页应并发抓取,峰值并发=%d(串行实现恒为 1)", peak)
+	}
+	for i, o := range objs {
+		if want := "f" + strconv.Itoa(i); o.Name != want {
+			t.Fatalf("第 %d 条乱序: got %q want %q", i, o.Name, want)
+		}
+	}
+}
+
 // TestGetRetriesTransientFailureOnce 锁住根节点读取的「瞬时失败重试一次」。
 // 第一次请求在传输层被断开(模拟 EasyTier 隧道重建窗口:连接在 ~10s 后被断,
 // 客户端拿到的是传输错误而不是 HTTP 状态),第二次成功。

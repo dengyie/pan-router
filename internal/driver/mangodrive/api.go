@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dengyie/panrouter/internal/driver"
@@ -190,27 +191,110 @@ func (a *API) get(ctx context.Context, p string) (*Obj, error) {
 //   (200 >= 0) → 恰好取满一页就停 → 目录超过 per_page(200)时**静默截断**,
 //   后面的文件对客户端完全不可见(表现为「文件夹里少了文件」且无任何报错)。
 //   故 total 只在 > 0 时作为终止判据;total 缺失时只能靠「本页不满」判断到底。
+//
+// ★ 已知 total 时剩余页并发抓取:pxed→OpenList 经 EasyTier,单次往返实测 ~3.2s
+//   (2026-11-17 04:43,602 文件平铺目录 list_ms=12883 = 4 页串行)。并发上限
+//   listConcurrency,顺序仍按页号拼接;total 缺失时退回串行(此时无法预知页数,
+//   并发只会放大未知响应形态的风险)。
 func (a *API) List(ctx context.Context, p string) ([]Obj, error) {
-	var all []Obj
-	for page := 1; page <= maxListPages; page++ {
-		var out struct {
-			Content []Obj `json:"content"`
-			Total   int   `json:"total"`
+	first, total, err := a.listPage(ctx, p, 1)
+	if err != nil {
+		return nil, err
+	}
+	all := first
+	switch {
+	case len(first) < listPageSize:
+		// 首屏就不满一页:到底了(无论 total 是否返回)。
+		return all, nil
+	case total <= 0:
+		// total 缺失:只能串行「翻到不满一页」。
+		for page := 2; page <= maxListPages; page++ {
+			content, _, err := a.listPage(ctx, p, page)
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, content...)
+			if len(content) < listPageSize {
+				break
+			}
 		}
-		err := a.do(ctx, http.MethodPost, "/api/fs/list", map[string]any{
-			"path": p, "password": "", "page": page, "per_page": listPageSize, "refresh": false,
-		}, &out)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, out.Content...)
-		lastPage := len(out.Content) < listPageSize
-		exhausted := out.Total > 0 && page*listPageSize >= out.Total
-		if lastPage || exhausted {
-			break
-		}
+		return all, nil
+	}
+
+	pages := (total + listPageSize - 1) / listPageSize
+	if pages > maxListPages {
+		pages = maxListPages
+	}
+	if pages <= 1 {
+		return all, nil
+	}
+	// 剩余页并发抓取,按页号回收,保证顺序不变。
+	rest := make([][]Obj, pages+1)
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sem := make(chan struct{}, listConcurrency)
+	for page := 2; page <= pages; page++ {
+		wg.Add(1)
+		go func(page int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			mu.Lock()
+			stop := firstErr != nil
+			mu.Unlock()
+			if stop {
+				return
+			}
+			content, _, err := a.listPage(cctx, p, page)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					cancel() // 其余页尽快退出,不白等隧道往返
+				}
+				mu.Unlock()
+				return
+			}
+			rest[page] = content
+		}(page)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	for page := 2; page <= pages; page++ {
+		all = append(all, rest[page]...)
 	}
 	return all, nil
+}
+
+// listPage 取单页(页码从 1 开始),返回内容与上游声明的 total。
+//
+// 进程级并发闸在这里按**单次请求**持有:listSem 的额度口径必须与真实上游
+// 请求一一对应,否则并发翻页会绕过闸门(见 driver.go listSem 注释)。
+func (a *API) listPage(ctx context.Context, p string, page int) ([]Obj, int, error) {
+	select {
+	case listSem <- struct{}{}:
+		defer func() { <-listSem }()
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	}
+	var out struct {
+		Content []Obj `json:"content"`
+		Total   int   `json:"total"`
+	}
+	err := a.do(ctx, http.MethodPost, "/api/fs/list", map[string]any{
+		"path": p, "password": "", "page": page, "per_page": listPageSize, "refresh": false,
+	}, &out)
+	if err != nil {
+		return nil, 0, err
+	}
+	return out.Content, out.Total, nil
 }
 
 // Mkdir 创建目录(已存在视为成功)。

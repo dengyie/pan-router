@@ -283,6 +283,48 @@ func TestAutoLinkParallelDedupesHints(t *testing.T) {
 	}
 }
 
+// 池状态已知时,driver 自带的「去添加账号」建议必须被丢掉:冷却中的账号明明
+// 存在,再让用户去「添加」只会自相矛盾。生产实证(2026-11-17,百度 9013):
+// 响应同时出现「账号正在冷却,约 300 秒后可再试」与「请先在『账号管理』添加
+// 百度账号 Cookie」——用户会去账号页找一个明明存在的账号。
+func TestAuthHintDropsConflictingAddAdvice(t *testing.T) {
+	const baiduHint = "百度提链需要登录态,请先在「账号管理」添加百度账号 Cookie"
+	resolver, store := newTestResolver(t, &twoFileDriver{},
+		config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	seedCookieAccount(t, store)
+	accs, _ := store.ListAccounts("fake")
+	if err := store.MarkAccountCooldown(accs[0].ID, time.Now().Add(90*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	err := resolver.mapErr(WithAuthed(context.Background(), true), "fake", nil,
+		driver.NewErr(driver.KindAuthExpired, baiduHint, nil))
+	var de *driver.Error
+	if !errors.As(err, &de) {
+		t.Fatalf("want driver.Error, got %v", err)
+	}
+	if strings.Contains(de.UserHint, "添加") {
+		t.Fatalf("冷却中不得再提示添加账号: %q", de.UserHint)
+	}
+	if !strings.Contains(de.UserHint, "冷却") || !strings.Contains(de.UserHint, "登录态") {
+		t.Fatalf("应保留冷却状态与失败原因: %q", de.UserHint)
+	}
+}
+
+func TestStripAddAdvice(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"百度提链需要登录态,请先在「账号管理」添加百度账号 Cookie", "百度提链需要登录态"},
+		{"请先在账号管理添加账号", ""},
+		{"凭据已失效,请更新", "凭据已失效,请更新"},
+		{"", ""},
+		{"A;请先添加账号;B", "A;B"},
+	}
+	for _, c := range cases {
+		if got := stripAddAdvice(c.in); got != c.want {
+			t.Fatalf("stripAddAdvice(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+}
+
 // 账号池查询失败不得伪装成「没配账号」:那会把用户引去账号页做无效操作,
 // 真因(DB 忙/锁/磁盘)也看不到。
 func TestPoolStateSurfacesStoreError(t *testing.T) {

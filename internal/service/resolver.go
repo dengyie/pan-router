@@ -305,18 +305,18 @@ func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, er
 				// 「请先添加账号」,把用户引去账号页做无效操作,运维也看不到
 				// DB 异常。这里给中性提示,真因进日志。
 				r.log.Warnw("pool state unavailable", "pan", pan, "err", perr)
-				de.UserHint = "该网盘账号暂不可用,请稍后重试;" + de.UserHint
+				de.UserHint = joinHint("该网盘账号暂不可用,请稍后重试", de.UserHint)
 			case cooling > 0:
 				wait := time.Until(nextReady)
 				if wait < time.Second {
 					wait = time.Second
 				}
-				de.UserHint = fmt.Sprintf("该网盘账号正在冷却(触发风控后自动降温),约 %d 秒后可再试;%s",
-					int(wait.Seconds()+0.5), de.UserHint)
+				de.UserHint = joinHint(fmt.Sprintf("该网盘账号正在冷却(触发风控后自动降温),约 %d 秒后可再试",
+					int(wait.Seconds()+0.5)), de.UserHint)
 			case total > 0:
-				de.UserHint = "该网盘账号不可用(已过期/封禁),请到「账号管理」更新;" + de.UserHint
+				de.UserHint = joinHint("该网盘账号不可用(已过期/封禁),请到「账号管理」更新", de.UserHint)
 			default:
-				de.UserHint = "该网盘需要登录态,请先在「账号管理」添加账号;" + de.UserHint
+				de.UserHint = joinHint("该网盘需要登录态,请先在「账号管理」添加账号", de.UserHint)
 			}
 		}
 	case driver.KindRiskControl:
@@ -337,6 +337,48 @@ func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, er
 			"pan", pan, "kind", de.Kind, "cause", logCause(de.Err))
 	}
 	return err
+}
+
+// joinHint 把「我方对池状态的判断」与 driver 的原始 hint 拼起来,并去掉后者
+// 里与事实冲突的建议(见 stripAddAdvice)。driver hint 为空时只回状态句,
+// 不留下悬空分隔符。
+func joinHint(state, driverHint string) string {
+	rest := stripAddAdvice(driverHint)
+	if rest == "" {
+		return state
+	}
+	return state + ";" + rest
+}
+
+// stripAddAdvice 去掉 hint 里「去账号管理添加账号/Cookie」这类建议。
+//
+// 只在池状态已判明时使用:冷却中 / 全部过期 / 查询失败三种情形下账号**明明存在**,
+// driver 的通用建议与事实冲突。生产实证(2026-11-17,百度账号冷却):响应同时出现
+// 「该网盘账号正在冷却…约 300 秒后可再试」与「请先在『账号管理』添加百度账号
+// Cookie」——前一句说账号在等冷却,后一句让用户去加一个已经存在的账号。保留解释
+// 失败原因的片段(「百度提链需要登录态」),只丢让人去「添加」的那一句。
+func stripAddAdvice(hint string) string {
+	if hint == "" {
+		return ""
+	}
+	var segs []string
+	for _, seg := range strings.FieldsFunc(hint, func(r rune) bool { return r == ';' || r == '；' }) {
+		var clauses []string
+		for _, c := range strings.FieldsFunc(seg, func(r rune) bool { return r == ',' || r == '，' }) {
+			c = strings.TrimSpace(c)
+			if c == "" {
+				continue
+			}
+			if strings.Contains(c, "添加") && (strings.Contains(c, "账号") || strings.Contains(c, "Cookie")) {
+				continue
+			}
+			clauses = append(clauses, c)
+		}
+		if len(clauses) > 0 {
+			segs = append(segs, strings.Join(clauses, ","))
+		}
+	}
+	return strings.Join(segs, ";")
 }
 
 // logCauseLimit 是落日志的上游原因长度上限:够看清错误类型与目标地址,又不至于

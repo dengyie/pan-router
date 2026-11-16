@@ -27,6 +27,10 @@ const (
 	maxListPages = 50
 	// listPageSize 单页条数(OpenList 上限 500)。
 	listPageSize = 200
+	// listConcurrency 单目录翻页并发上限(已知 total 时剩余页并行)。
+	// 隧道单次往返实测 ~3.2s:602 文件 4 页串行要 12.9s,并发后压到 2 个往返;
+	// 上限 4 既够快,又不至于把 OpenList / EasyTier 链路打满。
+	listConcurrency = 4
 )
 
 type Driver struct {
@@ -161,20 +165,28 @@ type treeListed struct {
 	err  error
 }
 
-// listSem 是全进程共享的目录列表并发闸。
+// listSem 是全进程共享的 fs/list 并发闸。
 //
 // treeListConc 只约束**单次解析**内部的并发;而桌面端可以并发发起多次解析
 // (批量解析上限 50),没有进程级闸时上游瞬时并发会按「请求数 × 4」放大,
 // OpenList 被自家客户端打出限流,表现就是部分目录读取失败、整树缺节点。
 // 故把并发额度做成进程级共享:单请求空闲时仍能拿满 4 路,多请求并发时
 // 排队而不是叠加。
+//
+// ★ 额度按**单次 HTTP 请求**计,不按目录计:API.List 在已知 total 时会并发抓
+//   剩余页(见 api.go),若额度按目录持有,大目录翻页会绕过本闸把上游并发放大
+//   到「4 目录 × 4 页」。按请求计还避免了「持有一个额度再申请更多额度」的
+//   自锁。
 var listSem = make(chan struct{}, treeListConc)
 
-// listOne 列一个目录:先拿进程级并发额度,再把 panic 收口成错误。
+// listOne 列一个目录:先把 panic 收口成错误,再交给 api.List。
 //
 // ★ listDirsBounded 在**独立 goroutine** 里调用它:driver 的 panic 不会经过
 //   chi 的 recoverer(net/http 只 recover 处理请求的那个 goroutine),逃出去
 //   就是整个进程崩溃。单个目录读坏没有理由毁掉服务,故在此收口。
+//
+// 进程级并发闸在 listPage(按单次 HTTP 请求)持有,这里不再重复申请 ——
+// 否则「持有一个额度再去要更多」在并发上限打满时会自锁。
 func listOne(ctx context.Context, api *API, p string) (list []Obj, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -182,12 +194,6 @@ func listOne(ctx context.Context, api *API, p string) (list []Obj, err error) {
 				"Mango Drive 列目录时发生内部错误", fmt.Errorf("panic: %v", r))
 		}
 	}()
-	select {
-	case listSem <- struct{}{}:
-		defer func() { <-listSem }()
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 	return api.List(ctx, p)
 }
 
