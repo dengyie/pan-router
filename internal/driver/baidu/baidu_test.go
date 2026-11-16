@@ -98,6 +98,8 @@ func TestClassifyErrno(t *testing.T) {
 		// 转存黑名单:高频「转存→删除」触发,不可重试,必须明确报风控。
 		{9013, "hit black uid share transfer", driver.KindRiskControl},
 		{31066, "", driver.KindRiskControl},
+		// filemanager 安全验证拦截(响应带 authwidget/safetpl):不可重试,归风控。
+		{132, "", driver.KindRiskControl},
 		{31061, "", driver.KindConflict},
 		{111, "", driver.KindUpstream},
 		{200025, "", driver.KindNotFound},
@@ -237,7 +239,7 @@ func TestGetDirectLinkTransferChain(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
 		case "/share/transfer":
 			_ = r.ParseForm()
@@ -305,7 +307,7 @@ func TestGetDirectLinkReusesCopy(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
 		case "/share/transfer":
 			transfers++
@@ -354,7 +356,7 @@ func TestSweepCopiesDeletesExpired(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{
 				{"path": "/panrouter_tmp/old.bin", "server_mtime": oldMtime},
 				{"path": "/panrouter_tmp/fresh.bin", "server_mtime": time.Now().Unix()},
@@ -411,7 +413,7 @@ func TestSweepCopiesDeletesRemoteOrphans(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{
 				{"path": "/panrouter_tmp/leftover.bin", "server_mtime": oldMtime},
 				{"path": "/panrouter_tmp/just-now.bin", "server_mtime": time.Now().Unix()},
@@ -458,7 +460,7 @@ func TestSweepCopiesKeepsLiveCopy(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{
 				{"path": "/panrouter_tmp/hot.bin", "server_mtime": oldMtime},
 			}})
@@ -503,7 +505,7 @@ func TestSweepCopiesKeepsLedgerOnDeleteFailure(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{
 				{"path": "/panrouter_tmp/old.bin", "server_mtime": oldMtime},
 			}})
@@ -552,7 +554,7 @@ func TestSweepCopiesThrottled(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": items})
 		case "/share/transfer":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
@@ -603,7 +605,7 @@ func TestReuseCopyRefreshesIdleTimer(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "urls": []map[string]any{
 				{"url": "https://appall01.baidupcs.com/plain", "encrypt": 0},
 			}})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -643,7 +645,7 @@ func TestReuseTransientFailureKeepsCopy(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": -1, "errmsg": "psign invalid"})
 		case "/api/filemetas":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": -1, "errmsg": "service busy"})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -693,7 +695,7 @@ func TestReuseGoneCopyRetransfers(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
 				{"to_fs_id": "999", "to": "/panrouter_tmp/a.bin"},
 			}}})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -726,7 +728,7 @@ func TestGetDirectLinkFallsBackToFilemetas(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "result": map[string]string{"bdstoken": "tok"}})
 		case "/api/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
 		case "/share/transfer":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "extra": map[string]any{"list": []map[string]any{
@@ -842,7 +844,7 @@ func TestTransferSurfacesShowMsg(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"errno": 200025, "errmsg": "", "show_msg": "提取码输入错误,请重试",
 			})
-		case "/api/list":
+		case "/rest/2.0/xpan/file":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0, "list": []map[string]any{}})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)

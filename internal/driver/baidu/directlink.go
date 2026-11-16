@@ -620,20 +620,26 @@ func (d *Driver) sweepCopies(ctx context.Context, cred *driver.Credential, dir s
 	}()
 }
 
-// dirEntry 是 api/list 的条目子集:清理只需要路径、类型与服务器时间。
+// dirEntry 是 xpan file 列目录的条目子集:清理只需要路径、类型与服务器时间。
 type dirEntry struct {
 	Path        string `json:"path"`
 	IsDir       int    `json:"isdir"`
 	ServerMtime int64  `json:"server_mtime"`
 }
 
-// dirListNum 暂存目录单页条数(台账上限 80,单页足够;对账时用它判断是否被截断)。
+// dirListNum 暂存目录单页条数(台账上限 80,单页足够)。
 const dirListNum = 1000
 
 // listDir 列出暂存目录内容(清理的远端真源)。
+//
+// 走 xpan `/rest/2.0/xpan/file?method=list`,不走 web 的 `/api/list`:后者即便
+// 登录态有效也恒回 `{"errno":8888,"errmsg":"test"}`(生产实证 2026-11-17,用
+// 驱动同款 Cookie/bdstoken 与两套 UA 复刻四种参数组合皆然),清扫若以它为
+// 真源则永远拿到空列表 —— 重启遗留的孤儿副本一个也清不掉,还会把它们全判成
+// 「远端不存在」而丢掉台账。
 func (d *Driver) listDir(ctx context.Context, cookie, dir string) ([]dirEntry, error) {
-	u := d.base + "/api/list?clienttype=0&app_id=" + appID +
-		"&web=1&order=time&desc=1&dir=" + url.QueryEscape(dir) + "&num=" + itoa(dirListNum) + "&page=1"
+	u := d.base + "/rest/2.0/xpan/file?method=list&dir=" + url.QueryEscape(dir) +
+		"&order=time&desc=1&start=0&limit=" + itoa(dirListNum) + "&web=1"
 	var out struct {
 		Errno  int        `json:"errno"`
 		ErrMsg string     `json:"errmsg"`

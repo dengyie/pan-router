@@ -186,6 +186,12 @@ func classifyErrno(errno int, msg string) *driver.Error {
 			hint += ":" + msg
 		}
 		return driver.NewErr(driver.KindRiskControl, hint, nil)
+	case 132:
+		// 生产实证(2026-11-17):filemanager 删除在风控态下回 errno=132,响应体带
+		// authwidget{safetpl:"filemanager"} —— 百度要求对该操作做人机安全验证,
+		// 不是参数错误,重试也没用。归风控,别让上层把它当上游抖动。
+		return driver.NewErr(driver.KindRiskControl,
+			"百度要求安全验证,已拒绝本次操作(请稍后重试或改用其他账号):"+msg, nil)
 	case 111:
 		// 空间不足 / 文件数超限
 		return driver.NewErr(driver.KindUpstream, "百度网盘空间不足或转存受限:"+msg, nil)
