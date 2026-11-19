@@ -159,3 +159,52 @@ func TestUpstreamRiskControlStillCoolsAccount(t *testing.T) {
 		t.Fatalf("上游风控必须冷却账号, status=%s", got)
 	}
 }
+
+// 百度「转存黑名单」(9013 hit black uid)的冷却必须加重到 50 分钟:黑名单窗口
+// 以分钟计,5 分钟短冷却会让账号回池后继续撞 /share/transfer,再次 9013 并加深
+// 风控画像(生产实证 2026-11-17 当天连续 5 次 hit black uid)。普通风控保持 5 分钟。
+func TestBaiduTransferBlacklistCoolsLonger(t *testing.T) {
+	drv := &failLinkDriver{fakeDriver: fakeDriver{linkURL: "https://up.invalid/f"},
+		err: driver.NewErr(driver.KindRiskControl,
+			"百度已限制该账号转存(触发风控黑名单),请稍后重试或改用其他账号:hit black uid share transfer", nil)}
+	dc := config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3}
+	resolver, store := newTestResolver(t, drv, dc)
+	acc, err := resolver.accounts.Create("fake", "a", "c=1", panKnown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedSnapshot(t, store, resolver.shareKey("fake", testShareURL, ""))
+	if _, err := resolver.ResolveFile(authedCtx(), testShareURL, "", "f1", false, ""); err == nil {
+		t.Fatal("风控必须向上返回错误")
+	}
+	got, gerr := store.GetAccount(acc.ID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if got.Status != "cooling" || got.CooldownUntil == nil {
+		t.Fatalf("黑名单必须冷却账号: status=%s until=%v", got.Status, got.CooldownUntil)
+	}
+	wait := time.Until(*got.CooldownUntil)
+	if wait < 45*time.Minute {
+		t.Fatalf("转存黑名单冷却应 ≈50 分钟, got %v", wait)
+	}
+	// 对照:普通风控文案保持 5 分钟。
+	d2 := &failLinkDriver{fakeDriver: fakeDriver{linkURL: "https://up.invalid/f"},
+		err: driver.NewErr(driver.KindRiskControl, "上游风控", nil)}
+	resolver2, store2 := newTestResolver(t, d2, dc)
+	acc2, err := resolver2.accounts.Create("fake", "b", "c=2", panKnown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedSnapshot(t, store2, resolver2.shareKey("fake", testShareURL, ""))
+	if _, err := resolver2.ResolveFile(authedCtx(), testShareURL, "", "f1", false, ""); err == nil {
+		t.Fatal("风控必须向上返回错误")
+	}
+	got2, gerr := store2.GetAccount(acc2.ID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if wait2 := time.Until(*got2.CooldownUntil); wait2 > 10*time.Minute {
+		t.Fatalf("普通风控冷却应保持 5 分钟, got %v", wait2)
+	}
+}

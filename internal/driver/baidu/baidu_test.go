@@ -120,6 +120,18 @@ func TestClassifyErrno(t *testing.T) {
 	if classifyErrno(0, "") != nil {
 		t.Fatal("errno 0 must be nil")
 	}
+	// 转存黑名单(9013 族)不可重试:黑名单窗口以分钟计,立即重试只会给风控
+	// 画像再添记录。NewErr 对 RiskControl 默认 Retriable=true,必须显式翻转。
+	for _, errno := range []int{9013, 9012, 9014} {
+		de := classifyErrno(errno, "hit black uid share transfer")
+		if de.Retriable {
+			t.Fatalf("errno=%d 转存黑名单不得标记 Retriable", errno)
+		}
+	}
+	// 对照:普通风控(如 42 请稍后重试)保持可重试语义。
+	if !classifyErrno(42, "请稍后重试").Retriable {
+		t.Fatal("普通风控应保持 Retriable=true")
+	}
 }
 
 // 分享解析:根目录 root=1;子目录 root=0 且必须带 BDCLND(=sekey);节点 Ext 带转存上下文。

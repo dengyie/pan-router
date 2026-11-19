@@ -182,11 +182,16 @@ func classifyErrno(errno int, msg string) *driver.Error {
 		// 账号拉进了**转存黑名单**(高频「转存→删除」循环最容易触发,实测一小时
 		// 约 20 次即中招)。这不是能重试掉的错误:冷却账号、换号,并在提示里明确
 		// 告诉用户,而不是含糊地报「接口异常」。
+		// Retriable 显式置 false(NewErr 对 RiskControl 默认 true):黑名单窗口
+		// 以分钟计,立即重试只会给风控画像再添记录。resolver 侧配合按「转存黑名单」
+		// 文案把冷却加重到 50 分钟(见 resolver.riskCooldown)。
 		hint := "百度已限制该账号转存(触发风控黑名单),请稍后重试或改用其他账号"
 		if msg != "" {
 			hint += ":" + msg
 		}
-		return driver.NewErr(driver.KindRiskControl, hint, nil)
+		de := driver.NewErr(driver.KindRiskControl, hint, nil)
+		de.Retriable = false
+		return de
 	case 132:
 		// 生产实证(2026-11-17):filemanager 删除在风控态下回 errno=132,响应体带
 		// authwidget{safetpl:"filemanager"} —— 百度要求对该操作做人机安全验证,

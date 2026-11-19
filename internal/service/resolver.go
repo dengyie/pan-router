@@ -205,6 +205,13 @@ func (r *Resolver) driverCfg(pan string) config.DriverCommon {
 	if dc, ok := r.cfg.Get().Drivers[pan]; ok {
 		return dc
 	}
+	// 配置缺失时的兜底必须是**最保守**值:生产 config.yaml 可能漏写某个 pan 的
+	// drivers 块(v2.16.9 前生产就漏了 baidu),旧兜底 LimitQPS=2/DownloadConc=3
+	// 是参考部署的通用值,对百度这类风控最严的上游偏激进一倍 —— 相当于漏配
+	// 即放大风控暴露。百度用设计值(limit_qps=1),其余 pan 用通用保守值。
+	if pan == "baidu" {
+		return config.DriverCommon{Enabled: true, LimitQPS: 1, DownloadConc: 2}
+	}
 	return config.DriverCommon{Enabled: true, LimitQPS: 2, DownloadConc: 3}
 }
 
@@ -321,7 +328,7 @@ func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, er
 		}
 	case driver.KindRiskControl:
 		if acc != nil {
-			r.accounts.MarkCooldown(acc.ID, 5*time.Minute)
+			r.accounts.MarkCooldown(acc.ID, riskCooldown(de))
 		}
 	}
 	// 被包装的上游原因(连接超时、TLS 握手失败、连接被复位、非 JSON 负载)只有
@@ -337,6 +344,24 @@ func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, er
 			"pan", pan, "kind", de.Kind, "cause", logCause(de.Err))
 	}
 	return err
+}
+
+// riskCooldown 决定一次上游风控要把账号冷却多久。
+//
+// 默认 5 分钟:限流/偶发验证类风控窗口短,长冷却白白缩池。
+//
+// 「转存黑名单」(百度 9013 hit black uid,提示文案含「转存黑名单」)单独加重到
+// 50 分钟:生产实证(2026-11-17)这种黑名单实际持续远超 5 分钟——账号 5 分钟后
+// 回池继续撞 /share/transfer,只会再次 9013 并给风控画像添记录(当天日志连续
+// 5 次 hit black uid 就是这个循环)。50 分钟与清扫侧 errno=132 的退避
+// (copySweepInterval×5)同量级,整点探测频率压到风控可接受的水平。
+// 判据用 driver hint 文案而非 pan 名:「黑名单」话术只有 baidu 9013 族驱动
+// 会产出,文案在 driver 内定义,service 不必复制 pan 清单。
+func riskCooldown(de *driver.Error) time.Duration {
+	if strings.Contains(de.UserHint, "黑名单") {
+		return 50 * time.Minute
+	}
+	return 5 * time.Minute
 }
 
 // joinHint 把「我方对池状态的判断」与 driver 的原始 hint 拼起来,并去掉后者
