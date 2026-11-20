@@ -243,6 +243,8 @@ func TestResolveShareNeedsPwd(t *testing.T) {
 
 // 转存链:暂存目录 → 转存 → locatedownload 选 encrypt=0;副本留在台账里复用,
 // **不**在提链后立刻删除(那正是把账号送进转存黑名单的循环)。
+// to_fs_id 用**数字**形态:生产实证(2026-11-20)百度同一接口两种形态都回过,
+// string 解码会把 errno=0 的成功转存误判成 interface_changed(v2.12 size 同型)。
 func TestGetDirectLinkTransferChain(t *testing.T) {
 	var transferred, sawSekey, deleted bool
 	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -262,7 +264,7 @@ func TestGetDirectLinkTransferChain(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"errno": 0,
 				"extra": map[string]any{"list": []map[string]any{
-					{"to_fs_id": "999", "to": "/panrouter_tmp/a.bin"},
+					{"to_fs_id": 999, "to": "/panrouter_tmp/a.bin"},
 				}},
 			})
 		case "/rest/2.0/pcs/file":

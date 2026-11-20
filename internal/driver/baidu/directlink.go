@@ -252,7 +252,7 @@ func (d *Driver) transfer(ctx context.Context, cookie, shareID, uk, sekey, fsid,
 		ShowMsg string `json:"show_msg"`
 		Extra   struct {
 			List []struct {
-				ToFsID string `json:"to_fs_id"`
+				ToFsID flexString `json:"to_fs_id"`
 				To     string `json:"to"`
 			} `json:"list"`
 		} `json:"extra"`
@@ -282,7 +282,7 @@ func (d *Driver) transfer(ctx context.Context, cookie, shareID, uk, sekey, fsid,
 	if to == "" {
 		to = strings.TrimRight(toDir, "/") + "/" + fsid
 	}
-	return first.ToFsID, to, nil
+	return string(first.ToFsID), to, nil
 }
 
 // ---- 取直链 ----

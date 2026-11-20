@@ -166,6 +166,16 @@ func (f *flexInt64) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// flexString 容忍百度把字符串字段同时给成 string 或 number(share/transfer 的
+// to_fs_id 实测两种形态都出现;用 string 直接解码会让成功的转存被判
+// interface_changed)。
+type flexString string
+
+func (f *flexString) UnmarshalJSON(b []byte) error {
+	*f = flexString(rawString(b))
+	return nil
+}
+
 func rawString(r json.RawMessage) string {
 	s := strings.TrimSpace(string(r))
 	return strings.Trim(s, `"`)
