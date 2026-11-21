@@ -84,9 +84,13 @@ func (d *Driver) ID() string { return "c139" }
 func (d *Driver) classify(resultCode, msg string) *driver.Error {
 	m := msg
 	switch {
+	// 生产实证(pxed 直探 ×3 稳定):假 linkID → resultCode 200000727
+	// 「外链不存在/外链被分享者取消」(确定性终态,不计熔断——pan123 v2.17.1/
+	// uc v2.18.1 同型口径)。桌面端错误码表未含此码,故必须探上游后登记。
 	case strings.Contains(m, "分享不存在") || strings.Contains(m, "链接不存在") ||
-		strings.Contains(m, "分享已失效") || strings.Contains(m, "已取消") ||
-		strings.Contains(m, "已删除") || resultCode == "10003" || resultCode == "10004":
+		strings.Contains(m, "外链不存在") || strings.Contains(m, "分享已失效") ||
+		strings.Contains(m, "已取消") || strings.Contains(m, "已删除") ||
+		resultCode == "10003" || resultCode == "10004" || resultCode == "200000727":
 		return driver.NewErr(driver.KindShareGone, "139 分享已失效("+m+")", nil)
 	case strings.Contains(m, "提取码") || strings.Contains(m, "密码"):
 		return driver.NewErr(driver.KindNotFound, "139 提取码错误("+m+")", nil)
@@ -438,7 +442,9 @@ func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred 
 	}
 	linkID := m[1]
 	bud := &shareWalkBudget{files: maxShareFiles, dirs: maxShareDirs}
-	nodes, err := d.walkShare(ctx, linkID, share.Pwd, "0", "", 0, map[string]struct{}{}, bud)
+	// 根目录 pCaID 必须传 "root"(生产实证:空串/0 报 200000400「pCaID不能为空」);
+	// 子目录传父 caID/coID。
+	nodes, err := d.walkShare(ctx, linkID, share.Pwd, "root", "", 0, map[string]struct{}{}, bud)
 	if err != nil {
 		return nil, err
 	}

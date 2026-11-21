@@ -89,6 +89,10 @@ func mockServer(t *testing.T) *httptest.Server {
 			if !strings.Contains(plain, `"account":""`) {
 				t.Errorf("list account must be empty: %s", plain)
 			}
+			// 根目录 pCaID 必须传 "root"(生产实证:空串/0 → 200000400 pCaID不能为空)
+			if req.GetOutLinkInfoReq.PCaID == "" || req.GetOutLinkInfoReq.PCaID == "0" {
+				t.Errorf("root pCaID must be 'root', got %q", req.GetOutLinkInfoReq.PCaID)
+			}
 			if req.GetOutLinkInfoReq.PCaID == "C100" {
 				writeJSON(w, encBody(t, shareListSub))
 				return
@@ -173,6 +177,24 @@ func TestResolveShareGone(t *testing.T) {
 	d := newTestDriver(t, srv)
 
 	_, err := d.ResolveShare(context.Background(), driver.ShareLink{URL: "https://yun.139.com/shareweb/#/w/i/gone123"}, nil)
+	var de *driver.Error
+	if !errors.As(err, &de) || de.Kind != driver.KindShareGone {
+		t.Fatalf("err = %v, want KindShareGone", err)
+	}
+}
+
+// 生产实证(2026-11-21,pxed 直探 ×3 稳定):假 linkID 上游恒回
+// resultCode 200000727「外链不存在/外链被分享者取消」(确定性终态)→
+// 必须映射 KindShareGone 而非 KindUpstream——否则 502+计入熔断
+// (pan123 v2.17.1 / uc v2.18.1 同型事故,口径统一:确定性终态不计熔断)。
+func TestShareNotExist200000727MapsShareGone(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, encBody(t, `{"resultCode":"200000727","success":true,"desc":"外链不存在/外链被分享者取消","data":null}`))
+	}))
+	defer srv.Close()
+	d := newTestDriver(t, srv)
+
+	_, err := d.ResolveShare(context.Background(), driver.ShareLink{URL: "https://yun.139.com/shareweb/#/w/i/fake1234"}, nil)
 	var de *driver.Error
 	if !errors.As(err, &de) || de.Kind != driver.KindShareGone {
 		t.Fatalf("err = %v, want KindShareGone", err)
