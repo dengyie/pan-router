@@ -6,6 +6,7 @@
 //   - 直链是 download-v2?params=<base64> 包装或整段 base64，解码后还得跟随 CDN 的
 //     JSON redirect_url（auto_redirect=0）才是最终可下载地址；
 //   - 下载直链必须带 Referer: https://yun.123pan.cn/。
+//
 // 网页私有接口改版只调整本包。签名算法见 sign.go（CRC32 派生，§6 抓包逐字还原）。
 package pan123
 
@@ -26,12 +27,12 @@ import (
 )
 
 const (
-	shareGetBase       = "https://yun.123pan.cn"       // 分享列表（匿名）
-	shareDownloadBase  = "https://www.123865.com"      // 分享下载信息（登录+签名）
-	dartUA             = "Dart/3.12 (dart:io)"
-	webUA              = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
-	downloadReferer    = "https://yun.123pan.cn/"
-	downloadLinkTTL    = 1 * time.Hour
+	shareGetBase      = "https://yun.123pan.cn"  // 分享列表（匿名）
+	shareDownloadBase = "https://www.123865.com" // 分享下载信息（登录+签名）
+	dartUA            = "Dart/3.12 (dart:io)"
+	webUA             = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+	downloadReferer   = "https://yun.123pan.cn/"
+	downloadLinkTTL   = 1 * time.Hour
 	// 分享目录遍历上界（与 quark 同口径）：防异常响应或超大分享拖死解析。
 	maxShareDepth = 8
 	maxShareFiles = 200
@@ -71,14 +72,14 @@ func (d *Driver) ID() string { return "pan123" }
 // ---- 上游响应结构（只解用到的字段） ----
 
 type apiFile struct {
-	FileID      json.Number `json:"FileId"`
-	FileName    string      `json:"FileName"`
-	Size        int64       `json:"Size"`
-	Type        int         `json:"Type"` // 1=目录
+	FileID       json.Number `json:"FileId"`
+	FileName     string      `json:"FileName"`
+	Size         int64       `json:"Size"`
+	Type         int         `json:"Type"` // 1=目录
 	ParentFileID json.Number `json:"ParentFileId"`
-	S3KeyFlag   string      `json:"S3KeyFlag"`
-	Etag        string      `json:"Etag"`
-	StorageNode string      `json:"StorageNode"`
+	S3KeyFlag    string      `json:"S3KeyFlag"`
+	Etag         string      `json:"Etag"`
+	StorageNode  string      `json:"StorageNode"`
 }
 
 type shareListResp struct {
@@ -271,11 +272,11 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 		return driver.DirectLink{}, driver.NewErr(driver.KindNotFound, "缺少 123 文件上下文（S3KeyFlag）,请重新解析", nil)
 	}
 	body := map[string]any{
-		"ShareKey": key,
-		"FileID":   jsonNumber(ref.FID),
+		"ShareKey":  key,
+		"FileID":    jsonNumber(ref.FID),
 		"S3KeyFlag": s3KeyFlag,
-		"Size":     jsonNumber(refSize(ref)),
-		"Etag":     etag,
+		"Size":      jsonNumber(refSize(ref)),
+		"Etag":      etag,
 	}
 	// 签名 path 与请求头一致（含 /b）；分享下载走 android 平台头，签名内部仍固定 web/3（桌面端 §6.3 实证）
 	var resp downloadInfoResp

@@ -16,11 +16,11 @@ import (
 )
 
 const (
-	platformWeb     = "web"
-	platformAndroid = "android"
-	appVersionWeb   = "3"
+	platformWeb       = "web"
+	platformAndroid   = "android"
+	appVersionWeb     = "3"
 	appVersionAndroid = "39"
-	signOffset      = 57600 // +16h（抓包实证）
+	signOffset        = 57600 // +16h（抓包实证）
 )
 
 // signTable 数字 0-9 的替换表（索引 = 数字值，§6.2）。
@@ -41,7 +41,7 @@ func makeSign(path string, ts int64) (string, string) {
 	authKey := strconv.FormatUint(uint64(crc32.ChecksumIEEE(sub)), 16)
 
 	// 2) auth-value：ts|random|path|web|3|auth-key 的 crc32
-	random := strconv.Itoa(int(time.Now().UnixNano()%10_000_000))
+	random := strconv.Itoa(int(time.Now().UnixNano() % 10_000_000))
 	data := strconv.FormatInt(ts, 10) + "|" + random + "|" + path + "|" + "web" + "|3|" + authKey
 	authValue := strconv.FormatInt(ts, 10) + "-" + random + "-" + strconv.FormatUint(uint64(crc32.ChecksumIEEE([]byte(data))), 16)
 	return authKey, authValue
@@ -51,14 +51,14 @@ func makeSign(path string, ts int64) (string, string) {
 func authHeaders(path, token, platform, appVersion string) map[string]string {
 	ak, av := makeSign(path, 0)
 	return map[string]string{
-		"platform":     platform,
-		"app-version":  appVersion,
+		"platform":      platform,
+		"app-version":   appVersion,
 		"authorization": "Bearer " + token,
-		"loginuuid":    "panrouter-server",
-		"auth-key":     ak,
-		"auth-value":   av,
-		"User-Agent":   webUA,
-		"Accept":       "application/json, text/plain, */*",
+		"loginuuid":     "panrouter-server",
+		"auth-key":      ak,
+		"auth-value":    av,
+		"User-Agent":    webUA,
+		"Accept":        "application/json, text/plain, */*",
 	}
 }
 
