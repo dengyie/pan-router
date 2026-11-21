@@ -159,6 +159,8 @@ func Default() *Config {
 		"quark":      {"pan.quark.cn"},
 		"mangodrive": {"drive.example.com"},
 		"baidu":      {"pan.baidu.com"},
+		// 139 分享链接域（桌面端 ShareLinkParser 同口径）。
+		"c139":       {"yun.139.com"},
 		// 123 云盘分享链接域（桌面端 ShareLinkParser 同口径:123pan/123865 两主域 + share 子域）。
 		"pan123":     {"123pan.com", "123pan.cn", "123865.com", "share.123pan.cn"},
 		"uc":         {"drive.uc.cn"},
@@ -181,6 +183,11 @@ func Default() *Config {
 		"baidu": {
 			Enabled: true, LimitQPS: 1, DownloadConc: 2,
 			RedirectAllow: []string{".baidu.com", ".baidupcs.com", ".baidupcs.cn", ".bdstatic.com"},
+		},
+		// 139(移动云盘):解析匿名(AES 加密体),直链需登录态;直链落华为云 OBS 签名域。
+		"c139": {
+			Enabled: true, LimitQPS: 2, DownloadConc: 3,
+			RedirectAllow: []string{".yun.139.com", ".139.com", ".hcyun.com"},
 		},
 		// 123 直链落 *.cjjd19.com 等 CDN 域,但域名随调度变化大;直链主要给浏览器 302 用,
 		// 服务端 /stream 拉流时不经本客户端,RedirectAllow 放宽到常见 CDN 后缀。
