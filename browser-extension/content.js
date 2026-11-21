@@ -1,5 +1,5 @@
 /**
- * 云析下载助手 —— 页面脚本
+ * MangoRouter 下载助手 —— 页面脚本
  *
  * 只做一件事：按需（popup 打开时）把页面里「看起来可以下载」的资源收集出来交给后台。
  * 不注入任何界面元素，不自动发起任何请求。
@@ -8,8 +8,8 @@
 (function () {
   'use strict';
 
-  if (window.__yunxCollectorInstalled) return;
-  window.__yunxCollectorInstalled = true;
+  if (window.__mangoCollectorInstalled) return;
+  window.__mangoCollectorInstalled = true;
 
   const EXT_RE = new RegExp(
     '\\.(mp4|m4v|mkv|webm|flv|f4v|mov|avi|ts|m3u8|mpd|mp3|m4a|aac|flac|wav|ogg|opus|' +
@@ -61,7 +61,7 @@
   }
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (!msg || msg.type !== 'yunx-dom-resources') return;
+    if (!msg || msg.type !== 'mango-dom-resources') return;
     try { sendResponse({ ok: true, resources: collect() }); }
     catch (e) { sendResponse({ ok: false, resources: [] }); }
   });

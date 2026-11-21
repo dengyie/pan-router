@@ -1,4 +1,4 @@
-# YunX-Desktop toast progress renderer (ASCII only; display text arrives via stdin UTF-8)
+# MangoRouter toast progress renderer (ASCII only; display text arrives via stdin UTF-8)
 #
 # stdin protocol (UTF-8, one command per line, pipe-separated):
 #   prog|<line1>|<pct 0-99>|<line2>|<value string>|<status label>   show/update progress toast
@@ -17,9 +17,9 @@
 # PowerShell 5.1 reads BOM-less files using the ANSI code page, which mangles non-ASCII text.
 $ErrorActionPreference = 'SilentlyContinue'
 try { [Console]::InputEncoding = [System.Text.Encoding]::UTF8 } catch {}
-$Aumid = 'YunX.Desktop'
-$Tag = 'yunx-dl'
-$Group = 'yunx'
+$Aumid = 'MangoRouter.Desktop'
+$Tag = 'mango-dl'
+$Group = 'mango'
 $SettingKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\' + $Aumid
 
 [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
@@ -54,7 +54,7 @@ while ($true) {
             $x = New-Object Windows.Data.Xml.Dom.XmlDocument
             $x.LoadXml((New-ToastXml $doneXml $p[1] $p[2] '' '' '' ''))
             $t = New-Object Windows.UI.Notifications.ToastNotification($x)
-            $t.Tag = 'yunx-done'; $t.Group = $Group
+            $t.Tag = 'mango-done'; $t.Group = $Group
             $notifier.Show($t)
             Write-Output 'Marker=DoneShown'
         } catch {

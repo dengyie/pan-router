@@ -24,8 +24,8 @@ cd PanRouter
 
 .\run.ps1 run        # 编译并启动（开发，含 darkmode.dll）
 .\run.ps1 build      # 仅编译 Kotlin（不需要 C++ 编译器）
-.\run.ps1 package    # 免安装便携版 → release\YunX-Desktop\
-.\run.ps1 installer  # 单文件安装程序 → release\YunX-Desktop-setup-*.exe
+.\run.ps1 package    # 免安装便携版 → release\MangoRouter\
+.\run.ps1 installer  # 单文件安装程序 → release\MangoRouter-setup-*.exe
 ```
 
 也可双击 `run.bat`（走同一入口）。中文向导语言包随仓库分发（`installer\ChineseSimplified.isl`）。
@@ -63,8 +63,8 @@ Beta=0           ← 第二行：Beta=1 预览版 / Beta=0 正式版（缺省 = 
 
 | 产物 | 位置 | 说明 |
 | --- | --- | --- |
-| 便携版 | `release\YunX-Desktop\` | 整个文件夹拷走即用，双击 `YunX-Desktop.exe` 运行，无需安装 |
-| 安装程序 | `release\YunX-Desktop-setup-<版本>.exe` | 每用户安装到 `%LOCALAPPDATA%\Programs\YunX-Desktop`，无需管理员权限；创建开始菜单 / 桌面快捷方式「云析」，可卸载 |
+| 便携版 | `release\MangoRouter\` | 整个文件夹拷走即用，双击 `MangoRouter.exe` 运行，无需安装 |
+| 安装程序 | `release\MangoRouter-setup-<版本>.exe` | 每用户安装到 `%LOCALAPPDATA%\Programs\MangoRouter`，无需管理员权限；创建开始菜单 / 桌面快捷方式「MangoRouter」，可卸载 |
 
 打包脚本会自动结束正在运行的程序实例，并在输出目录被占用时重试删除。
 
@@ -139,6 +139,6 @@ Get-ChildItem desktop\src\main\kotlin -Recurse -Filter *.kt | ForEach-Object {
 | --- | --- |
 | `desktop/` | 应用本体（Kotlin + Compose Multiplatform） |
 | `desktop/native/` | 原生桥接层源码（`darkmode.cpp` → `darkmode.dll`） |
-| `launcher/` | 自研启动器（C# 编译为无控制台窗口的 exe；固定读取 `app\YunX-Desktop.cfg`，改 exe 名或放在中文路径下都不会失效，同时负责启动闪屏与主窗口交叉淡入） |
+| `launcher/` | 自研启动器（C# 编译为无控制台窗口的 exe；固定读取 `app\MangoRouter.cfg`，改 exe 名或放在中文路径下都不会失效，同时负责启动闪屏与主窗口交叉淡入） |
 | `installer/` | Inno Setup 脚本与中文语言包 |
 | `docs/` | 文档（见 [README](../README.md#文档)） |

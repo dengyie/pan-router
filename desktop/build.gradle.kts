@@ -110,11 +110,11 @@ val generateAppVersion by tasks.registering {
     inputs.property("version", version)
     inputs.property("isPreview", isPreview)
     doLast {
-        val pkgDir = outDir.get().asFile.resolve("com/yunx/app")
+        val pkgDir = outDir.get().asFile.resolve("com/mango/app")
         pkgDir.mkdirs()
         pkgDir.resolve("AppVersion.kt").writeText(
             """
-            |package com.yunx.app
+            |package com.mango.app
             |
             |/** 由根目录 version.txt 生成，请勿手改 */
             |internal const val APP_VERSION = "$version"
@@ -129,11 +129,11 @@ kotlin.sourceSets["main"].kotlin.srcDir(generateAppVersion)
 
 // ---- 遮罩选位器 EXE 打进 jar 资源 ----
 // picker\PositionPicker.cs 由 run.ps1 / portable-package.ps1 用 csc 编到仓库根 build\ 下，
-// 这里把它作为资源塞进 jar 的 yunx\ 前缀；运行期由 util/PositionPicker.kt 释放到 %TEMP% 再执行，
+// 这里把它作为资源塞进 jar 的 mango\ 前缀；运行期由 util/PositionPicker.kt 释放到 %TEMP% 再执行，
 // 因此发布包目录里不再出现这个原生 exe。（文件不存在时 from() 会静默跳过）
 tasks.named<ProcessResources>("processResources") {
-    val pickerExe = rootProject.layout.projectDirectory.file("build/YunX-PositionPicker.exe")
-    from(pickerExe) { into("yunx") }
+    val pickerExe = rootProject.layout.projectDirectory.file("build/MangoRouter-PositionPicker.exe")
+    from(pickerExe) { into("mango") }
 }
 
 tasks.withType<Test> {
@@ -141,7 +141,7 @@ tasks.withType<Test> {
     jvmArgs("-Dfile.encoding=UTF-8", "-Dsun.jnu.encoding=UTF-8")
     // 数据目录整体重定向到 build/：Log 门面、AppContext 等单例在测试里被触达时
     // 只写构建产物目录，绝不污染真实用户目录（历史教训：GatewayTest 直写注册表、
-    // 引擎测试把「推送被拒」假错误写进真实 yunx-desktop.log 干扰过生产排障）
+    // 引擎测试把「推送被拒」假错误写进真实 mango-router.log 干扰过生产排障）
     environment("YUNX_DESKTOP_DATA_DIR", layout.buildDirectory.dir("test-data").get().asFile.absolutePath)
 }
 
@@ -156,23 +156,23 @@ tasks.register<JavaExec>("testInProcess") {
     mainClass.set("org.junit.runner.JUnitCore")
     classpath = testInProcessClasspath
     args = listOf(
-        "com.yunx.app.data.network.VideoLinkParserTest",
-        "com.yunx.app.data.network.ShareLinkParserTest",
-        "com.yunx.app.data.network.StarSeaApiTest",
-        "com.yunx.app.data.download.HlsRequestPolicyTest",
-        "com.yunx.app.data.download.HttpRangePolicyTest",
-        "com.yunx.app.data.download.DownloadPathPolicyTest",
-        "com.yunx.app.data.download.DownloadGroupingTest",
-        "com.yunx.app.data.download.DirectPartManifestTest",
-        "com.yunx.app.data.download.DownloadSaverTest",
-        "com.yunx.app.data.download.ChunkDownloaderDirectTest",
-        "com.yunx.app.data.download.DownloadCacheMaintenanceTest",
-        "com.yunx.app.data.download.DownloadManagerDirectIntegrationTest",
-        "com.yunx.app.data.db.SecureAccountDaosTest",
-        "com.yunx.app.data.security.DbKeyStoreTest",
-        "com.yunx.app.ui.login.XunleiVerificationPolicyTest",
-        "com.yunx.app.data.network.XunleiWebCredentialTest",
-        "com.yunx.app.util.LogRedactorTest"
+        "com.mango.app.data.network.VideoLinkParserTest",
+        "com.mango.app.data.network.ShareLinkParserTest",
+        "com.mango.app.data.network.StarSeaApiTest",
+        "com.mango.app.data.download.HlsRequestPolicyTest",
+        "com.mango.app.data.download.HttpRangePolicyTest",
+        "com.mango.app.data.download.DownloadPathPolicyTest",
+        "com.mango.app.data.download.DownloadGroupingTest",
+        "com.mango.app.data.download.DirectPartManifestTest",
+        "com.mango.app.data.download.DownloadSaverTest",
+        "com.mango.app.data.download.ChunkDownloaderDirectTest",
+        "com.mango.app.data.download.DownloadCacheMaintenanceTest",
+        "com.mango.app.data.download.DownloadManagerDirectIntegrationTest",
+        "com.mango.app.data.db.SecureAccountDaosTest",
+        "com.mango.app.data.security.DbKeyStoreTest",
+        "com.mango.app.ui.login.XunleiVerificationPolicyTest",
+        "com.mango.app.data.network.XunleiWebCredentialTest",
+        "com.mango.app.util.LogRedactorTest"
     )
 }
 
@@ -259,7 +259,7 @@ tasks.register<Sync>("exportJcefNatives") {
 
 compose.desktop {
     application {
-        mainClass = "com.yunx.app.MainKt"
+        mainClass = "com.mango.app.MainKt"
         nativeDistributions {
             targetFormats(TargetFormat.Exe)
             // sqlite-jdbc 通过反射加载 java.sql.Driver，jlink 自动检测不到，必须显式声明；
@@ -271,10 +271,10 @@ compose.desktop {
             windows {
                 perUserInstall = true
             }
-            packageName = "YunX-Desktop"
+            packageName = "MangoRouter"
             packageVersion = appVersion
             // 注意：jpackage 参数文件解析不支持非 ASCII 描述（本机报 "Input length = 1"），描述保持纯英文
-            description = "PanRouter Desktop - netdisk share-link parser and high-speed downloader (YunX-Desktop fork with PanRouter integration)"
+            description = "MangoRouter - netdisk share-link parser and high-speed downloader (PanRouter desktop client)"
             vendor = "dengyie"
             copyright = "Copyright (C) 2026 dengyie (based on YunX-Desktop by tidain, AGPL-3.0)"
         }

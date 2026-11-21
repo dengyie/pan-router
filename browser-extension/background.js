@@ -1,16 +1,16 @@
 /**
- * 云析下载助手 —— 后台服务（MV3 Service Worker）
+ * MangoRouter 下载助手 —— 后台服务（MV3 Service Worker）
  *
  * 职责：
  *  1. 嗅探：用 webRequest.onHeadersReceived 只读观察响应头，记录可下载资源（体积/MIME/文件名）；
- *  2. 接管：chrome.downloads.onCreated → cancel + erase，把请求 POST 到云析本地回环桥，
- *     由云析弹窗询问「保存到哪里 / 用多少线程」，决定后再分流处理；
- *  3. 归还：用户在云析弹窗点「归还浏览器下载」时，用 chrome.downloads.download 重新发起，
+ *  2. 接管：chrome.downloads.onCreated → cancel + erase，把请求 POST 到MangoRouter本地回环桥，
+ *     由 MangoRouter弹窗询问「保存到哪里 / 用多少线程」，决定后再分流处理；
+ *  3. 归还：用户在MangoRouter 弹窗点「归还浏览器下载」时，用 chrome.downloads.download 重新发起，
  *     并对该根域名（eTLD+1）写入 5 分钟冷却，冷却期内不再接管该域名及以下子域名的下载。
  *
- * 与云析的通信：云析在本机 127.0.0.1 的 37021-37030 区间监听（见 App 侧 BrowserBridgeServer）。
+ * 与 MangoRouter的通信：MangoRouter在本机 127.0.0.1 的 37021-37030 区间监听（见 App 侧 BrowserBridgeServer）。
  * 扩展逐个端口 GET /ping 探测，命中后拿到本次进程的随机 token；之后 POST /hook 带 token 提交请求。
- * 云析没运行时探测不到 → 完全不接管，浏览器下载照常。
+ * MangoRouter 没运行时探测不到 → 完全不接管，浏览器下载照常。
  */
 
 'use strict';
@@ -115,9 +115,9 @@ const sniffByUrl = new Map();
 
 // ---------------------------------------------------------------- 小工具
 
-const log = (...a) => console.log('[YunX]', ...a);
+const log = (...a) => console.log('[MangoRouter]', ...a);
 
-/** service worker 保活：长时间等待云析弹窗时定期调用一个扩展 API 重置空闲计时器 */
+/** service worker 保活：长时间等待MangoRouter 弹窗时定期调用一个扩展 API 重置空闲计时器 */
 function keepAlive() {
   const id = setInterval(() => {
     try { chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError); } catch (e) { /* ignore */ }
@@ -254,9 +254,9 @@ async function clearCooldown(root) {
   } catch (e) { /* ignore */ }
 }
 
-// ---------------------------------------------------------------- 与云析的本地桥
+// ---------------------------------------------------------------- 与 MangoRouter的本地桥
 
-/** 扫描端口区间探测云析；命中后缓存 { port, token } */
+/** 扫描端口区间探测 MangoRouter；命中后缓存 { port, token } */
 async function ensureBridge(force) {
   if (bridge && !force) return bridge;
   bridge = null;
@@ -265,9 +265,9 @@ async function ensureBridge(force) {
       const r = await fetch('http://127.0.0.1:' + p + '/ping', { method: 'GET', cache: 'no-store' });
       if (!r.ok) continue;
       const j = await r.json();
-      if (j && j.app === 'yunx') {
+      if (j && j.app === 'mango-router') {
         bridge = { port: p, token: j.token || '' };
-        log('已连接云析本地桥：端口', p);
+        log('已连接MangoRouter本地桥：端口', p);
         return bridge;
       }
     } catch (e) {
@@ -300,7 +300,7 @@ async function cookieHeader(url) {
   }
 }
 
-/** 组装发给云析的请求体 */
+/** 组装发给MangoRouter的请求体 */
 async function buildPayload(info) {
   const url = info.url;
   const host = hostOf(url);
@@ -322,7 +322,7 @@ async function buildPayload(info) {
 }
 
 /**
- * POST /hook：把请求交给云析弹窗，挂起等待用户决定（云析侧最长等 120 秒，超时按「归还」处理）。
+ * POST /hook：把请求交给 MangoRouter弹窗，挂起等待用户决定（MangoRouter 侧最长等 120 秒，超时按「归还」处理）。
  * @returns {Promise<{action:'accept'|'cancel'|'return', saveDir?:string, threads?:number}>}
  */
 async function postHook(payload) {
@@ -333,7 +333,7 @@ async function postHook(payload) {
     const r = await fetch('http://127.0.0.1:' + b.port + '/hook', {
       method: 'POST',
       cache: 'no-store',
-      headers: { 'Content-Type': 'application/json', 'X-YunX-Token': b.token },
+      headers: { 'Content-Type': 'application/json', 'X-Mango-Token': b.token },
       body: JSON.stringify(payload),
     });
     if (r.status === 401) { invalidateBridge(); return { action: 'return' }; }
@@ -351,39 +351,39 @@ async function postHook(payload) {
 }
 
 /**
- * POST 静默提交：把视频下载请求交给云析直接加入下载队列。
+ * POST 静默提交：把视频下载请求交给 MangoRouter直接加入下载队列。
  *
- * 与 /hook 不同，这里**不挂起等用户决定**：清晰度/下载方式都已在插件页定好（或交给云析按
- * 平台最高档解析），云析收到即返回，解析与入队都在它后台完成，不弹窗、不打断浏览。
+ * 与 /hook 不同，这里**不挂起等用户决定**：清晰度/下载方式都已在插件页定好（或交给 MangoRouter按
+ * 平台最高档解析），MangoRouter收到即返回，解析与入队都在它后台完成，不弹窗、不打断浏览。
  * @param {string} path 桥接端点：`/bili`（BVID + 清晰度 + 方式）或 `/video`（页面链接）
  * @returns {Promise<{ok:boolean, error?:string}>}
  */
 async function postSilent(path, payload) {
   const b = await ensureBridge(false);
-  if (!b) return { ok: false, error: '未检测到云析，请先启动云析' };
+  if (!b) return { ok: false, error: '未检测到MangoRouter，请先启动 MangoRouter' };
   try {
     const r = await fetch('http://127.0.0.1:' + b.port + path, {
       method: 'POST',
       cache: 'no-store',
-      headers: { 'Content-Type': 'application/json', 'X-YunX-Token': b.token },
+      headers: { 'Content-Type': 'application/json', 'X-Mango-Token': b.token },
       body: JSON.stringify(payload),
     });
-    if (r.status === 401) { invalidateBridge(); return { ok: false, error: '云析连接已失效，请重试' }; }
-    if (!r.ok) return { ok: false, error: '云析拒绝请求（' + r.status + '）' };
+    if (r.status === 401) { invalidateBridge(); return { ok: false, error: 'MangoRouter连接已失效，请重试' }; }
+    if (!r.ok) return { ok: false, error: 'MangoRouter拒绝请求（' + r.status + '）' };
     const d = await r.json().catch(() => null);
     if (d && d.ok) return { ok: true };
-    return { ok: false, error: (d && d.error) || '云析处理失败' };
+    return { ok: false, error: (d && d.error) || 'MangoRouter处理失败' };
   } catch (e) {
     log(path + ' 提交失败：', e && e.message);
     invalidateBridge();
-    return { ok: false, error: '提交失败：请确认云析正在运行' };
+    return { ok: false, error: '提交失败：请确认MangoRouter正在运行' };
   }
 }
 
 /** 归还浏览器下载：重新发起下载（带 Referer，失败则退回不带请求头） */
 async function redownload(payload) {
   const base = { url: payload.url, conflictAction: 'uniquify' };
-  if (payload.fileName) base.filename = 'YunX/' + payload.fileName;
+  if (payload.fileName) base.filename = 'MangoRouter/' + payload.fileName;
   const headers = [];
   if (payload.referer) headers.push({ name: 'Referer', value: payload.referer });
   try {
@@ -397,17 +397,17 @@ async function redownload(payload) {
 // ---------------------------------------------------------------- 通用下载流程
 
 /**
- * 走一遍「交给云析 → 按决定分流」的流程。
+ * 走一遍「交给 MangoRouter → 按决定分流」的流程。
  * @param info {url, fileName?, fileSize?, pageUrl?, referer?, mime?}
  * @returns 决定结果
  */
-async function handOverToYunx(info) {
+async function handOverToMangoRouter(info) {
   const payload = await buildPayload(info);
   const decision = await postHook(payload);
   if (decision.action === 'accept') {
     setBadge('✓', '#2e86ff');
     setTimeout(() => setBadge(''), 3000);
-    log('已交给云析下载', payload.fileName, decision.threads ? '(' + decision.threads + ' 线程)' : '');
+    log('已交给 MangoRouter下载', payload.fileName, decision.threads ? '(' + decision.threads + ' 线程)' : '');
   } else if (decision.action === 'return') {
     // 冷却按「发起下载的页面域名」锚定（取不到才退回资源域名），与后续接管检查、
     // popup 查询/清除保持同一口径，避免只冷却到 CDN 域名导致对不上。
@@ -489,7 +489,7 @@ async function onDownloadCreated(item) {
     const root = cooldownRoot(item.referrer || '', url);
     if (await isCoolingDown(root)) return; // 刚归还过，5 分钟内不再接管该站点
 
-    // 探测云析；没运行就完全不干预浏览器下载
+    // 探测 MangoRouter；没运行就完全不干预浏览器下载
     const b = await ensureBridge(false);
     if (!b) return;
 
@@ -505,7 +505,7 @@ async function onDownloadCreated(item) {
     });
 
     const sniffed = sniffByUrl.get(url) || null;
-    await handOverToYunx({
+    await handOverToMangoRouter({
       url: url,
       fileName: sniffed && sniffed.fileName ? sniffed.fileName : fileNameFromUrl(url),
       fileSize: item.fileSize > 0 ? item.fileSize : (sniffed ? sniffed.size : -1),
@@ -523,9 +523,9 @@ async function onDownloadCreated(item) {
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
     void chrome.runtime.lastError;
-    chrome.contextMenus.create({ id: 'yunx-link', title: '用云析下载此链接', contexts: ['link'] });
-    chrome.contextMenus.create({ id: 'yunx-media', title: '用云析下载此资源', contexts: ['video', 'audio'] });
-    chrome.contextMenus.create({ id: 'yunx-image', title: '用云析下载此图片', contexts: ['image'] });
+    chrome.contextMenus.create({ id: 'mango-link', title: '用MangoRouter 下载此链接', contexts: ['link'] });
+    chrome.contextMenus.create({ id: 'mango-media', title: '用MangoRouter 下载此资源', contexts: ['video', 'audio'] });
+    chrome.contextMenus.create({ id: 'mango-image', title: '用MangoRouter 下载此图片', contexts: ['image'] });
   });
 });
 
@@ -534,7 +534,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!/^https?:/i.test(url)) return;
   const st = await getSettings();
   if (!st.enabled) return;
-  await handOverToYunx({
+  await handOverToMangoRouter({
     url: url,
     pageUrl: (tab && tab.url) || info.pageUrl || '',
     referer: (tab && tab.url) || info.pageUrl || '',
@@ -558,7 +558,7 @@ async function collectResources(tabId) {
   if (tabId >= 0) {
     dom = await new Promise((resolve) => {
       try {
-        chrome.tabs.sendMessage(tabId, { type: 'yunx-dom-resources' }, (resp) => {
+        chrome.tabs.sendMessage(tabId, { type: 'mango-dom-resources' }, (resp) => {
           if (chrome.runtime.lastError) { resolve([]); return; }
           resolve((resp && resp.resources) || []);
         });
@@ -586,17 +586,17 @@ async function collectResources(tabId) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return;
 
-  if (msg.type === 'yunx-get-settings') {
+  if (msg.type === 'mango-get-settings') {
     getSettings().then((s) => sendResponse({ ok: true, settings: s }));
     return true;
   }
 
-  if (msg.type === 'yunx-set-settings') {
+  if (msg.type === 'mango-set-settings') {
     setSettings(msg.settings || {}).then((s) => sendResponse({ ok: true, settings: s }));
     return true;
   }
 
-  if (msg.type === 'yunx-status') {
+  if (msg.type === 'mango-status') {
     ensureBridge(true).then((b) => {
       setBadge(b ? '' : '');
       sendResponse({ ok: true, connected: !!b, port: b ? b.port : 0 });
@@ -604,14 +604,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg.type === 'yunx-get-resources') {
+  if (msg.type === 'mango-get-resources') {
     const tabId = typeof msg.tabId === 'number' ? msg.tabId : -1;
     collectResources(tabId).then((list) => sendResponse({ ok: true, resources: list }));
     return true;
   }
 
   // 当前页面所在的根域名是否处于「归还后」的冷却期，以及还剩多久
-  if (msg.type === 'yunx-cooldown-status') {
+  if (msg.type === 'mango-cooldown-status') {
     (async () => {
       const root = rootDomainOf(hostOf(msg.url || msg.pageUrl || ''));
       const remainMs = await cooldownRemaining(root);
@@ -621,7 +621,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   // 立即恢复捕获：只解除当前页面根域名的冷却
-  if (msg.type === 'yunx-cooldown-clear') {
+  if (msg.type === 'mango-cooldown-clear') {
     (async () => {
       const root = rootDomainOf(hostOf(msg.url || msg.pageUrl || ''));
       await clearCooldown(root);
@@ -630,11 +630,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg.type === 'yunx-download') {
+  if (msg.type === 'mango-download') {
     (async () => {
       const st = await getSettings();
       if (!st.enabled) { sendResponse({ ok: false, error: '插件未启用' }); return; }
-      const d = await handOverToYunx({
+      const d = await handOverToMangoRouter({
         url: msg.url,
         fileName: msg.fileName || '',
         fileSize: typeof msg.size === 'number' ? msg.size : -1,
@@ -647,7 +647,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg.type === 'yunx-bili-download') {
+  if (msg.type === 'mango-bili-download') {
     (async () => {
       const st = await getSettings();
       if (!st.enabled) { sendResponse({ ok: false, error: '插件未启用' }); return; }
@@ -663,8 +663,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // 其他视频平台（抖音 / 微博 / AcFun …）：只把页面链接交给云析，由云析解析成可下载流
-  if (msg.type === 'yunx-video-download') {
+  // 其他视频平台（抖音 / 微博 / AcFun …）：只把页面链接交给 MangoRouter，由 MangoRouter解析成可下载流
+  if (msg.type === 'mango-video-download') {
     (async () => {
       const st = await getSettings();
       if (!st.enabled) { sendResponse({ ok: false, error: '插件未启用' }); return; }

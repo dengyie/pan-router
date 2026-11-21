@@ -1,12 +1,12 @@
-// YunX-Desktop 便携版启动器（进程内 JVM + 启动闪屏）
+// MangoRouter 便携版启动器（进程内 JVM + 启动闪屏）
 //
 // 职责：
 // 1. 双击后 ~100ms 内渐显启动闪屏（应用图标 + 「正在启动…」），遮盖 JVM/Compose 启动延迟
-// 2. 解析 app\YunX-Desktop.cfg，用 JNI 在【本进程内】创建 JVM 并调用主类
-//    （不再另起 runtime\bin\java.exe 子进程 → 任务管理器只显示一个「云析 YunX-Desktop」进程）
+// 2. 解析 app\MangoRouter.cfg，用 JNI 在【本进程内】创建 JVM 并调用主类
+//    （不再另起 runtime\bin\java.exe 子进程 → 任务管理器只显示一个「MangoRouter」进程）
 // 3. 检测到应用主窗口后交叉淡出：闪屏淡出 + 应用窗口通过 WS_EX_LAYERED 由透明渐入，
 //    实现无缝衔接
-// 4. 固定读取 app\YunX-Desktop.cfg（不跟随 exe 名）→ 支持任意重命名；全程宽字符 API → 兼容中文路径
+// 4. 固定读取 app\MangoRouter.cfg（不跟随 exe 名）→ 支持任意重命名；全程宽字符 API → 兼容中文路径
 //
 // 由打包脚本用 csc 编译为 winexe（无控制台窗口），并内嵌应用图标。
 
@@ -19,7 +19,7 @@ using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
-namespace YunXDesktop
+namespace MangoRouter
 {
     static class Launcher
     {
@@ -85,7 +85,7 @@ namespace YunXDesktop
                 string appDir = Path.Combine(root, "app");
                 string runtimeBin = Path.Combine(root, "runtime", "bin");
                 string jvmDll = Path.Combine(runtimeBin, "server", "jvm.dll");
-                string cfgPath = Path.Combine(appDir, "YunX-Desktop.cfg");
+                string cfgPath = Path.Combine(appDir, "MangoRouter.cfg");
 
                 if (!File.Exists(jvmDll))
                 {
@@ -112,7 +112,7 @@ namespace YunXDesktop
                 javaOpts.Insert(0, "-Djava.class.path=" + string.Join(";", classpath.ToArray()));
 
                 // 闪屏模式：java 侧窗口全透明启动、内容就绪后自行渐入（与闪屏淡出交叉）
-                if (useSplash) Environment.SetEnvironmentVariable("YUNXPC_SPLASH", "1");
+                if (useSplash) Environment.SetEnvironmentVariable("MANGOROUTER_SPLASH", "1");
 
                 // 工作目录与 java.exe 启动保持一致（<root>）
                 Directory.SetCurrentDirectory(root);
@@ -228,7 +228,7 @@ namespace YunXDesktop
                     watcher.Start();
                 }
 
-                // ---- 调用 com.yunx.app.MainKt.main(String[])（阻塞直到应用退出）----
+                // ---- 调用 com.mango.app.MainKt.main(String[])（阻塞直到应用退出）----
                 callStaticVoidMethodA(env, mainKtClass, mainMid, jvaluePtr);
 
                 int code = 0;
@@ -294,7 +294,7 @@ namespace YunXDesktop
         }
 
         /// 等待应用主窗口出现 → 闪屏淡出。
-        /// 应用窗口的渐入由 java 侧自行完成（YUNXPC_SPLASH=1：窗口全透明显示，内容首帧就绪后渐入）。
+        /// 应用窗口的渐入由 java 侧自行完成（MANGOROUTER_SPLASH=1：窗口全透明显示，内容首帧就绪后渐入）。
         /// @return 是否检测到应用主窗口
         static bool CrossFade()
         {
@@ -352,7 +352,7 @@ namespace YunXDesktop
         {
             try
             {
-                MessageBox.Show(msg, "云析 YunX-Desktop", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(msg, "MangoRouter", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch { }
         }
@@ -431,7 +431,7 @@ namespace YunXDesktop
             BackColor = Color.FromArgb(27, 28, 31);
             Opacity = 0;
 
-            string icoPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "YunX-Desktop.ico");
+            string icoPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "MangoRouter.ico");
             try { appIcon = new Icon(icoPath, 96, 96); }
             catch
             {
@@ -493,13 +493,13 @@ namespace YunXDesktop
             if (appIcon != null)
                 g.DrawIcon(appIcon, new Rectangle(w / 2 - 40, 40, 80, 80));
 
-            // 标题：云析 / YunX-Desktop 两行
-            var sz = g.MeasureString("云析", titleFont);
+            // 标题：MangoRouter 主标题 + 副标题两行
+            var sz = g.MeasureString("MangoRouter", titleFont);
             using (var b = new SolidBrush(Color.FromArgb(236, 236, 241)))
-                g.DrawString("云析", titleFont, b, (w - sz.Width) / 2f, 126);
-            var sz2 = g.MeasureString("YunX-Desktop", subFont);
+                g.DrawString("MangoRouter", titleFont, b, (w - sz.Width) / 2f, 126);
+            var sz2 = g.MeasureString("MangoRouter", subFont);
             using (var b = new SolidBrush(Color.FromArgb(154, 160, 166)))
-                g.DrawString("YunX-Desktop", subFont, b, (w - sz2.Width) / 2f, 160);
+                g.DrawString("MangoRouter", subFont, b, (w - sz2.Width) / 2f, 160);
 
             // 流光进度条：轨道 + 两端羽化的移动高亮段
             int trackW = 200, trackH = 4, trackY = 202;

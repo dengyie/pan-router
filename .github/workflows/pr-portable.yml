@@ -60,11 +60,11 @@ jobs:
         # 因此本步骤改用 pwsh(UTF-8 默认),脚本体同时去掉非 ASCII 双保险。
         shell: pwsh
         run: |
-          $name = "YunX-Desktop-portable-${{ github.event.pull_request.number || github.run_number }}"
-          # cd into release so zip root is YunX-Desktop\ (unzip then double-click exe)
+          $name = "MangoRouter-portable-${{ github.event.pull_request.number || github.run_number }}"
+          # cd into release so zip root is MangoRouter\ (unzip then double-click exe)
           Push-Location .\release
           try {
-            & 7z a -tzip -mx=5 "..\$name.zip" "YunX-Desktop" | Out-Null
+            & 7z a -tzip -mx=5 "..\$name.zip" "MangoRouter" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "7z pack failed" }
           } finally {
             Pop-Location
@@ -78,8 +78,8 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: YunX-Desktop-portable-${{ github.event.pull_request.number || github.run_number }}
-          path: YunX-Desktop-portable-*.zip
+          name: MangoRouter-portable-${{ github.event.pull_request.number || github.run_number }}
+          path: MangoRouter-portable-*.zip
           retention-days: 14
           # 文件本身已是 zip，跳过二次压缩
           compression-level: 0

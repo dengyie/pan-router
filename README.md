@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="desktop/src/main/resources/icon.png" width="120" alt="PanRouter 桌面端" />
+<img src="desktop/src/main/resources/icon.png" width="120" alt="MangoRouter" />
 
-# PanRouter 桌面端
+# MangoRouter
 
 **粘贴分享链接，直接高速下载 —— PanRouter 的 Windows 桌面客户端**
 
@@ -27,7 +27,7 @@ Range 分片并发 + 断点续传，B 站高清自动合轨。
 > **本仓库为二次开发版本**，基于 [tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop)（v1.3.3，
 > [CYQawa/YunX](https://github.com/CYQawa/YunX) 安卓版的 Windows 移植；感谢上游项目）。
 > 在上游基础上新增：**PanRouter 服务端解析整合** —— 网盘分享解析优先交由自部署的 PanRouter 服务端
-> （固定出口 IP 防风控、直链缓存、多账号池），下载仍走云析本地分片引擎；服务端未覆盖或不可达时自动回落本地原生解析链。
+> （固定出口 IP 防风控、直链缓存、多账号池），下载仍走 MangoRouter 本地分片引擎；服务端未覆盖或不可达时自动回落本地原生解析链。
 > 改动范围见 [docs/INTEGRATION-PANROUTER.md](docs/INTEGRATION-PANROUTER.md)。按 AGPL-3.0 要求，本仓库完整保留上游提交历史。
 
 ## 简介
@@ -79,13 +79,13 @@ PanRouter 桌面端：粘贴**网盘分享链接**或**视频作品链接**，�
 
 ## 浏览器插件
 
-仓库 `browser-extension/` 内含 Chrome / Edge 扩展「**云析下载助手**」（Manifest V3）—— 让浏览器下载接管到云析的多线程下载。
+仓库 `browser-extension/` 内含 Chrome / Edge 扩展「**MangoRouter 下载助手**」（Manifest V3）—— 让浏览器下载接管到 MangoRouter的多线程下载。
 
 - **嗅探页面资源**：列出当前网页里可下载的媒体与文件，按图片 / 视频 / 音频 / 文档 / 压缩包 / 程序 / 字体分类，图片与视频支持卡片预览。
-- **接管浏览器下载**：浏览器开始下载时自动接管（取消浏览器下载并抹掉记录），由云析弹窗询问保存目录与线程数（最高 512，超过 32 需二次确认）。
+- **接管浏览器下载**：浏览器开始下载时自动接管（取消浏览器下载并抹掉记录），由 MangoRouter弹窗询问保存目录与线程数（最高 512，超过 32 需二次确认）。
 - **归还浏览器下载**：点「归还浏览器下载」后重新发起浏览器原生下载，并对该页面网站（根域名及其子域名）写入 **5 分钟冷却**；冷却期内打开插件可看到「还有 X 分 YY 秒」倒计时，并可点「立即重新开始」单独解除当前网站的冷却。
-- **视频平台卡片**：B 站视频页可选清晰度与下载方式；抖音 / 微博 / AcFun 视频页可一键交给云析解析下载。
-- **安全**：扩展与云析通过本机回环 HTTP（`127.0.0.1`，随机 token）通信，网页脚本无法伪造请求；**云析没运行时探测不到端口，扩展完全不干预浏览器下载**。
+- **视频平台卡片**：B 站视频页可选清晰度与下载方式；抖音 / 微博 / AcFun 视频页可一键交给 MangoRouter解析下载。
+- **安全**：扩展与 MangoRouter 通过本机回环 HTTP（`127.0.0.1`，随机 token）通信，网页脚本无法伪造请求；**MangoRouter 没运行时探测不到端口，扩展完全不干预浏览器下载**。
 
 安装、开关与工作原理见 [浏览器插件说明](browser-extension/README.md)。
 
@@ -163,8 +163,8 @@ cd PanRouter
 
 .\run.ps1 run        # 编译并启动（开发，含 darkmode.dll）
 .\run.ps1 build      # 仅编译 Kotlin（不需要 C++ 编译器）
-.\run.ps1 package    # 免安装便携版 → release\YunX-Desktop\
-.\run.ps1 installer  # 单文件安装程序 → release\YunX-Desktop-setup-*.exe
+.\run.ps1 package    # 免安装便携版 → release\MangoRouter\
+.\run.ps1 installer  # 单文件安装程序 → release\MangoRouter-setup-*.exe
 ```
 
 环境要求、版本号管理与打包产物见 **[构建与打包](docs/BUILD.md)**。
@@ -172,7 +172,7 @@ cd PanRouter
 ## 常见问题
 
 <details>
-<summary><b>这个 fork 和上游 YunX-Desktop 是什么关系？</b></summary>
+<summary><b>这个 fork 和上游 MangoRouter 是什么关系？</b></summary>
 
 本仓库是 [tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop)（v1.3.3）的二次开发版本，
 与上游**独立版本线**（应用更新通道指向本仓库 Releases，不会弹上游的更新），专注于 PanRouter 服务端整合。
@@ -190,8 +190,8 @@ cd PanRouter
 <details>
 <summary><b>便携版和安装版有什么区别？</b></summary>
 
-便携版是免安装的文件夹，拷到任意位置双击 `YunX-Desktop.exe` 即可运行；
-安装版走安装向导，安装到 `%LOCALAPPDATA%\Programs\YunX-Desktop`，并创建开始菜单 / 桌面快捷方式，可在设置中卸载。
+便携版是免安装的文件夹，拷到任意位置双击 `MangoRouter.exe` 即可运行；
+安装版走安装向导，安装到 `%LOCALAPPDATA%\Programs\MangoRouter`，并创建开始菜单 / 桌面快捷方式，可在设置中卸载。
 两者功能完全一致。
 
 </details>

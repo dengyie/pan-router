@@ -3,14 +3,14 @@
 //   Gradle 对仓库 5xx（如 aliyun 偶发 502，2026-11-12 v0.1.12 发版实证）不会
 //   落到下一个仓库而是直接中止解析 → CI 不设开关就完全不碰镜像，镜像故障
 //   不再能打挂发版。本机开启方式（二选一）：
-//     - 全局 %USERPROFILE%\.gradle\gradle.properties 加 yunx.useAliyunMirror=true
-//     - 环境变量 YUNX_USE_ALIYUN_MIRROR=1
+//     - 全局 %USERPROFILE%\.gradle\gradle.properties 加 mango.useAliyunMirror=true
+//     - 环境变量 MANGO_USE_ALIYUN_MIRROR=1
 // 注意：pluginManagement 是独立编译作用域，访问不到脚本顶层声明，
 // 判定必须在两个块内各自内联（勿上提为顶层 val）。
 
 pluginManagement {
-    val useAliyunMirror = providers.environmentVariable("YUNX_USE_ALIYUN_MIRROR").isPresent ||
-            providers.gradleProperty("yunx.useAliyunMirror").isPresent
+    val useAliyunMirror = providers.environmentVariable("MANGO_USE_ALIYUN_MIRROR").isPresent ||
+            providers.gradleProperty("mango.useAliyunMirror").isPresent
     repositories {
         if (useAliyunMirror) {
             maven("https://maven.aliyun.com/repository/gradle-plugin")
@@ -24,8 +24,8 @@ pluginManagement {
 }
 
 dependencyResolutionManagement {
-    val useAliyunMirror = providers.environmentVariable("YUNX_USE_ALIYUN_MIRROR").isPresent ||
-            providers.gradleProperty("yunx.useAliyunMirror").isPresent
+    val useAliyunMirror = providers.environmentVariable("MANGO_USE_ALIYUN_MIRROR").isPresent ||
+            providers.gradleProperty("mango.useAliyunMirror").isPresent
     repositories {
         if (useAliyunMirror) {
             maven("https://maven.aliyun.com/repository/google")
@@ -42,5 +42,5 @@ plugins {
     id("org.gradle.toolchains.foojay-resolver-convention") version "0.8.0"
 }
 
-rootProject.name = "YunX-Desktop"
+rootProject.name = "MangoRouter"
 include(":desktop")

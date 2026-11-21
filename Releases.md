@@ -1,4 +1,4 @@
-# 云析桌面版 v1.3.3（fork 基线）
+# MangoRouter（fork 自MangoRouter MangoRouter v1.3.3 基线）
 
 > 发布日期：2026-10-31
 > 本节为 fork 时上游 [tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop) v1.3.3 的发布说明存档（基线参考）。
@@ -48,7 +48,7 @@
 
 - **便携版**：解压即用
 
-- **安装版**：安装到 `%LOCALAPPDATA%\Programs\YunX-Desktop`
+- **安装版**：安装到 `%LOCALAPPDATA%\Programs\MangoRouter`
 
 > 视频预览与 DASH 合轨所需的 FFmpeg、以及 P2P / 外部下载所需的 **Gopeed 引擎**均**不随安装包发布**，首次使用时可在应用内「引擎管理」一键下载（装到应用私有目录，不改系统环境变量）。
 
