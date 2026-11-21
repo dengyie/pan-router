@@ -219,6 +219,23 @@ func TestShareGoneMapping(t *testing.T) {
 	}
 }
 
+// 生产实证(2026-11-21):假 pwd_id 上游恒回 code 41006「分享不存在」(status 404,
+// 确定性终态)→ 必须映射 KindShareGone 而非 KindUpstream——否则 502+计入熔断
+// (pan123 v2.17.1 同型事故,口径统一:确定性终态不计熔断)。
+func TestShareNotExist41006MapsShareGone(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, `{"status":404,"code":41006,"message":"分享不存在"}`)
+	}))
+	defer srv.Close()
+	d := newTestDriver(t, srv)
+
+	_, err := d.ResolveShare(context.Background(), driver.ShareLink{URL: "https://drive.uc.cn/s/aaaaaaaa"}, nil)
+	var de *driver.Error
+	if !errors.As(err, &de) || de.Kind != driver.KindShareGone {
+		t.Fatalf("err = %v, want KindShareGone", err)
+	}
+}
+
 func TestCheckCredential(t *testing.T) {
 	srv := mockServer(t)
 	defer srv.Close()

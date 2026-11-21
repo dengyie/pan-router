@@ -83,7 +83,10 @@ type ucFile struct {
 }
 
 // ---- 错误分类 ----
-// 错误码表对齐桌面端 guestErrorMessage(31001/23018/14001/41020 为游客链路实证码)。
+// 错误码表对齐桌面端 guestErrorMessage(31001/23018/14001/41020 为游客链路实证码);
+// 41006「分享不存在」为生产实证(假 pwd_id 恒回,确定性终态)。
+// 确定性终态(share_gone/not_found)不计熔断——否则一次手滑链接把整条 pan 通道打入 10min 熔断
+// (pan123 v2.17.1 同型事故,口径统一)。
 
 func (d *Driver) classify(code int, msg string) *driver.Error {
 	switch {
@@ -91,6 +94,8 @@ func (d *Driver) classify(code int, msg string) *driver.Error {
 		return driver.NewErr(driver.KindAuthExpired, "该分享需要登录 UC 网盘后才能下载("+msg+")", nil)
 	case code == 23018 || strings.Contains(msg, "游客"):
 		return driver.NewErr(driver.KindAuthExpired, "该文件超出游客可获取上限,请添加 UC 账号("+msg+")", nil)
+	case code == 41006 || strings.Contains(msg, "分享不存在"):
+		return driver.NewErr(driver.KindShareGone, "UC 分享不存在("+msg+")", nil)
 	case code == 14001 || code == 41020 || strings.Contains(msg, "失效") || strings.Contains(msg, "过期"):
 		return driver.NewErr(driver.KindShareGone, "UC 分享已失效或令牌过期,请重新解析("+msg+")", nil)
 	case strings.Contains(msg, "验证") || strings.Contains(msg, "频繁") || strings.Contains(msg, "稍后再试"):
