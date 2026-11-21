@@ -17,6 +17,7 @@ import (
 	"github.com/dengyie/panrouter/internal/driver/baidu"
 	"github.com/dengyie/panrouter/internal/driver/lanzou"
 	"github.com/dengyie/panrouter/internal/driver/mangodrive"
+	"github.com/dengyie/panrouter/internal/driver/pan123"
 	"github.com/dengyie/panrouter/internal/driver/quark"
 	"github.com/dengyie/panrouter/internal/pkg/breaker"
 	"github.com/dengyie/panrouter/internal/pkg/crypto"
@@ -38,6 +39,9 @@ var driverFactories = map[string]func(context.Context, *httpx.Client, config.Dri
 	},
 	"baidu": func(_ context.Context, c *httpx.Client, _ config.DriverCommon) (driver.Driver, error) {
 		return baidu.New(c, ""), nil
+	},
+	"pan123": func(_ context.Context, c *httpx.Client, _ config.DriverCommon) (driver.Driver, error) {
+		return pan123.New(c), nil
 	},
 	"mangodrive": func(_ context.Context, c *httpx.Client, dc config.DriverCommon) (driver.Driver, error) {
 		d := mangodrive.New(c)

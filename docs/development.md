@@ -348,6 +348,20 @@ iframe / modern / 密码分享三条流;最终 CDN 对非浏览器客户端先 a
 - **错误码补录**:`200025` = 转存阶段提取码/`sekey` 校验未通过(真实文案只在 `show_msg`,`errmsg` 为空)→ `not_found`;`errno=2` 在转存场景多为「转存路径不存在」(暂存目录被外部删除)
 - ⚠️ 配置缺口:生产 `config.yaml` 若无 `drivers.baidu` 块,`driverCfg` 兜底成 `limit_qps=2 / download_concurrency=3`(与本节默认值不一致,偏激进)。已记入部署核对项:生产显式写 `baidu: {enabled: true, limit_qps: 1, download_concurrency: 2}`
 
+### 10.6 pan123(123 云盘, v2.17)
+
+与蓝奏云同属「网页 API」阵营(无 OAuth 开放平台口径),接口口径**完全对齐姊妹桌面端 MangoRouter 生产在用的 Pan123Api**(抓包实证),网页私有接口改版只调整本包:
+
+- **ResolveShare(匿名)**:`GET yun.123pan.cn/b/api/share/get`(无签名;`SharePwd` **无提取码时不传**,传空值会 400「请输入Next」);`Next` 是字符串游标(`"-1"` 无下一页 / `""` 还有下一页);`Expired=true` → share_gone;目录递归预算与 quark 同口径(深度 8 / 文件 200 / 目录 64,截断标记置末节点 Ext)。链接形态:`www.123pan.com/s/<key>` / `www.123865.com/s/<key>` / `<uid>.share.123pan.cn/123pan/<key>`(ShareKey 两段 `-` 连接)
+- **GetDirectLink(登录+签名)**:`POST www.123865.com/b/api/share/download/info`,body `{ShareKey,FileID(数字),S3KeyFlag,Size,Etag}`;**签名头 `auth-key`/`auth-value`**(CRC32 派生:auth-key = crc32(替换表映射后的 UTC YYYYMMDDHHmm,基准 ts+57600s),auth-value = `ts-random-crc32(ts|random|path|web|3|auth-key)`,内部固定 web/3 与请求头 platform 无关——实现见 sign.go);分享下载走 android 平台头
+- **直链两层解码**:`DownloadURL` 是 `download-v2?params=<base64 urlsafe>` 包装或整段 base64(两种形态都解,解不出按原样);解码后直链若带 `auto_redirect=0`,GET 它返回 JSON `{data:{redirect_url}}` 而非文件 —— 循环跟随(≤5 跳),仅当响应体小(≤8KB)才解析,大响应视为真实文件流
+- **直链约束**:`Referer: https://yun.123pan.cn/` 必带,不绑 Cookie/UA(浏览器 302 可用);TTL 1h
+- **错误映射**:`code!=0` 统一判;`401`/文案含「登录/token」→ auth_expired(触发账号看门狗),其余 → upstream;HTML 响应(风控页)→ risk_control
+- **CheckCredential**:`GET /b/api/user/info`(带签名),回昵称
+- **暂不支持**:`Own` 网盘内文件提链(unsupported);浏览器插件/桌面端覆盖集上线后自动获得分享解析能力,账号贡献需 123 账号 JWT(账号密码登录,桌面端已有)
+- 默认 `limit_qps: 2`、`download_concurrency: 3`;域名路由 `123pan.com/123pan.cn/123865.com/share.123pan.cn`
+- **测试**:`contract_test.go` 12 用例(httptest 回放:平铺+嵌套树解析、失效分享、坏链接、无凭据拒绝、happy path 全跟随链、裸直链、401 映射、缺上下文、凭据校验、签名确定性、双形态 URL 解码、预算截断)
+
 ### 10.5 限频 / 熔断 / 并发闸
 
 - 限频:每网盘 token bucket,键 = `pan`(登录)/ `pan:guest`(游客),速率 = `drivers.*.limit_qps`(float64,支持小数;容量 ≥ 1、首扣令牌,P2-7 已修)
@@ -512,6 +526,7 @@ iframe / modern / 密码分享三条流;最终 CDN 对非浏览器客户端先 a
 
 ## 变更记录
 
+- **v2.17(2026-11-21)**:**新增 123 云盘 driver(`internal/driver/pan123`,路线图「123/UC/139/189」第一项落地;HTTP 契约零变化——纯新增 pan_type,既有网盘行为不动)**。分享解析匿名(`GET yun.123pan.cn/b/api/share/get`,SharePwd 空值陷阱:无提取码不传),直链需 123 账号 JWT + `auth-key/auth-value` 签名头(CRC32 派生,ts+57600s 时间偏移,内部固定 web/3);`DownloadURL` 两层解码(`download-v2?params=<base64>` 包装/整段 base64 → CDN `auto_redirect=0` JSON redirect_url 跟随≤5 跳,小响应≤8KB 才解析);直链只绑 Referer 不绑 Cookie(浏览器 302 可用);401 → auth_expired 触发看门狗。**口径对齐姊妹桌面端 MangoRouter 生产在用的 Pan123Api(抓包实证),不在服务端另起一套**。装配:driverFactories `pan123` 条目 + config 默认键(`limit_qps:2 / download_concurrency:3`,RedirectAllow `.123pan.cn/.cjjd19.com` 等)+ 域名路由 `123pan.com/123pan.cn/123865.com/share.123pan.cn`;**生产 config.yaml 零改动**(viper 按 key 覆盖,未写的键保留默认——`TestDefaultPan123KeySurvivesPartialYaml` 验证过,后按 YAGNI 移除该用例,行为由 Unmarshal 语义保证)。测试:`contract_test.go` 12 用例(httptest 回放,零真实网盘请求),`go vet ./...` 干净,全量 15 包 `go test ./... -count=1` 全绿(`-race` 由 CI 兜底)。桌面端零改动(覆盖集自学习,下次解析自动识别 pan123)。
 - **v2.16.10(2026-11-20)**:baidu 转存响应 `to_fs_id` 数字形态兼容(flexString;HTTP 契约零变化)。**生产实证**:转存黑名单解除后首次真解析(v2.16.9 部署后),`/share/transfer` 回 `errno:0` 转存**成功**,但 `extra.list[].to_fs_id` 是 JSON **数字**,`string` 解码失败让整个成功响应被判 `interface_changed`「百度响应不是合法 JSON,疑似接口改版」——与 v2.12 修过的 `xpan/share` size 字符串形态完全同型(数字/字符串两种形态百度都会给,不能假设)。修复:新增 `flexString`(`rawString` 剥引号,与 `flexInt64` 同型),`transfer()` 的 `ToFsID` 字段改用,返回处 `string()` 转换;回归 `TestGetDirectLinkTransferChain` 的夹具改用**数字形态** `"to_fs_id": 999`(原有字符串形态用例在其余 13 处夹具保持,两形态均有覆盖)。`go vet ./...` 干净、全包 `go test ./... -count=1` 全绿(`-race` 由 CI 承担)。
 - **v2.16.9(2026-11-20)**:百度账号保护加固(用户指令「你做好账号保护吧」;HTTP 契约除 `retriable` 字段语义外零变化)。背景:2026-11-17 生产实证一小时内 ~20 次「转存+删除」即触发 `errno=9013 hit black uid share transfer`(转存黑名单),当天日志 5 次命中;账号凭据始终 `valid=true`(未封号),黑名单窗口过后自愈。审计发现两处保护缺口:**① 9013 冷却只有 5 分钟**——黑名单实际持续远超 5 分钟,账号 5 分钟后回池继续撞 `/share/transfer`,每次都是给风控画像再喂一条记录;**② 生产 `config.yaml` 漏写 `baidu:` drivers 块**(development.md §百度 配置缺口早已记录但未落地),`driverCfg` 兜底成 `limit_qps=2/download_concurrency=3`,比设计值(`limit_qps=1/download_concurrency=2`)激进一倍。修复:**㉜** `riskCooldown(de)` 按 hint 文案区分冷却时长——含「黑名单」(只有 baidu 9013 族会产出)冷却 50 分钟(与清扫侧 errno=132 退避 `copySweepInterval×5` 同量级),普通风控保持 5 分钟;判据用文案而非 pan 名,service 不复制 pan 清单。**㉝** baidu 9013/9012/9014 错误显式 `Retriable=false`(NewErr 对 RiskControl 默认 true)——黑名单窗口立即重试毫无意义,客户端 HTTP 契约的 `retriable:false` 如实反映。**㉞** `driverCfg` 兜底对 baidu 用设计最保守值 `limit_qps=1/download_concurrency=2`(其余 pan 维持通用兜底);生产控制面 `/personal/pxed/panrouter/config.yaml` 同步显式补 `baidu:` 块(0600,NFS,不经 git)。测试:`TestBaiduTransferBlacklistCoolsLonger`(黑名单 ≈50 分钟 + 普通风控对照 ≤10 分钟)、`classifyErrno` 表补 9013 族 `Retriable=false` 与普通风控 `Retriable=true` 对照。`go vet ./...` 干净、全包 `go test ./... -count=1` 全绿(`-race` 由 CI 承担)。
 

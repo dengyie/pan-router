@@ -159,6 +159,8 @@ func Default() *Config {
 		"quark":      {"pan.quark.cn"},
 		"mangodrive": {"drive.example.com"},
 		"baidu":      {"pan.baidu.com"},
+		// 123 云盘分享链接域（桌面端 ShareLinkParser 同口径:123pan/123865 两主域 + share 子域）。
+		"pan123":     {"123pan.com", "123pan.cn", "123865.com", "share.123pan.cn"},
 		"lanzou":     {"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", "lanzouu.com"},
 	}
 	c.Drivers = map[string]DriverCommon{
@@ -178,6 +180,12 @@ func Default() *Config {
 		"baidu": {
 			Enabled: true, LimitQPS: 1, DownloadConc: 2,
 			RedirectAllow: []string{".baidu.com", ".baidupcs.com", ".baidupcs.cn", ".bdstatic.com"},
+		},
+		// 123 直链落 *.cjjd19.com 等 CDN 域,但域名随调度变化大;直链主要给浏览器 302 用,
+		// 服务端 /stream 拉流时不经本客户端,RedirectAllow 放宽到常见 CDN 后缀。
+		"pan123": {
+			Enabled: true, LimitQPS: 2, DownloadConc: 3,
+			RedirectAllow: []string{".123pan.cn", ".123pan.com", ".123865.com", ".cjjd19.com", ".cjjd001.com"},
 		},
 	}
 	c.Aria2.Endpoint = "http://127.0.0.1:6800/jsonrpc"
