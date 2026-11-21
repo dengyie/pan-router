@@ -161,6 +161,7 @@ func Default() *Config {
 		"baidu":      {"pan.baidu.com"},
 		// 123 云盘分享链接域（桌面端 ShareLinkParser 同口径:123pan/123865 两主域 + share 子域）。
 		"pan123":     {"123pan.com", "123pan.cn", "123865.com", "share.123pan.cn"},
+		"uc":         {"drive.uc.cn"},
 		"lanzou":     {"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", "lanzouu.com"},
 	}
 	c.Drivers = map[string]DriverCommon{
@@ -186,6 +187,12 @@ func Default() *Config {
 		"pan123": {
 			Enabled: true, LimitQPS: 2, DownloadConc: 3,
 			RedirectAllow: []string{".123pan.cn", ".123pan.com", ".123865.com", ".cjjd19.com", ".cjjd001.com"},
+		},
+		// UC 与夸克同源接口(pc-api.uc.cn),游客取链开箱即用(__pugs 游客态,无需账号)。
+		// 直链落 *.ucshw.com 等自有 CDN 域,保守放行 uc.cn 系;域名变化时用户可显式覆盖。
+		"uc": {
+			Enabled: true, LimitQPS: 2, DownloadConc: 3,
+			RedirectAllow: []string{".uc.cn", ".ucshw.com"},
 		},
 	}
 	c.Aria2.Endpoint = "http://127.0.0.1:6800/jsonrpc"
