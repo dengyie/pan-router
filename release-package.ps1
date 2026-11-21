@@ -25,7 +25,7 @@ try {
 $mb = [math]::Round((Get-Item "$name.zip").Length / 1MB, 1)
 Write-Host "[OK] release asset: $name.zip ($mb MB)"
 
-$notes = "PanRouter 桌面端 $Tag 便携版（免安装，解压即用）。`n`n基于 MangoRouter（[tidain/MangoRouter](https://github.com/tidain/MangoRouter)，AGPL-3.0）二次开发，整合 PanRouter 服务端解析。源码与更新：https://github.com/dengyie/PanRouter"
+$notes = "PanRouter 桌面端 $Tag 便携版（免安装，解压即用）。`n`n基于 tidain/YunX-Desktop（[tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop)，AGPL-3.0，本项目品牌名 MangoRouter）二次开发，整合 PanRouter 服务端解析。源码与更新：https://github.com/dengyie/PanRouter"
 
 # 幂等发版:tag 被重指向后重推(历史重写/发版重跑)时 Release 已存在,
 # gh release create 会撞名失败——生产实证 v0.1.12 重发即此形态。

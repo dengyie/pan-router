@@ -1,6 +1,22 @@
 {
   "announcements": [
     {
+      "id": "mangorouter-v014-rebrand",
+      "title": "MangoRouter v0.1.14：品牌焕新，数据自动迁移",
+      "summary": "应用更名为 MangoRouter（全新图标），老用户升级后数据/账号/设置自动带入，无需任何手动操作。",
+      "content": "## 更名公告\n\n本项目（PanRouter 桌面端）应用品牌正式更名为 **MangoRouter**，启用全新图标。功能不变，开源协议（AGPL-3.0）与上游致谢不变。\n\n## 老用户升级说明（自动，零操作）\n\n升级后首次启动会自动完成三层数据迁移：\n\n- 数据目录：`~/.yunx-desktop`（或 `.yunx-pc`）→ `~/.mango-router`（整体改名，大文件不复制）\n- 数据库：`yunx.db` → `mango-router.db`（连同 WAL 一起改名，任务/收藏/历史/账号无损带入）\n- 应用设置：注册表 Prefs 节点 `yunx/*` → `mango/router/*`\n\n登录态、下载任务、收藏、历史、网页 Cookie 全部自动带入。旧的敏感残留（旧库、旧缓存）会在迁移后的下一次启动自动清理。\n\n## 本版本其他变化\n\n- 浏览器扩展协议头同步更名（`X-Mango-Token`），扩展与应用需一起升级\n- 新增数据迁移回归测试，锁住「升级零丢失」契约\n- 修正对外发布物中的上游署名（tidain/YunX-Desktop）\n\n下载见 GitHub Releases。",
+      "publishAt": "2026-11-21T00:00:00+08:00",
+      "author": "MangoRouter",
+      "publisher": {
+        "name": "MangoRouter",
+        "avatarUrl": null
+      },
+      "isPinned": false,
+      "targets": [
+        "desktop"
+      ]
+    },
+    {
       "id": "panrouter-v013-private-free",
       "title": "PanRouter 桌面端 v0.1.3：公告源自有化",
       "summary": "从本版本起，应用内公告改由 PanRouter 仓库直接发布，不再请求任何原作者的个人服务器。",
@@ -12,7 +28,9 @@
         "avatarUrl": null
       },
       "isPinned": true,
-      "targets": ["desktop"]
+      "targets": [
+        "desktop"
+      ]
     }
   ]
 }

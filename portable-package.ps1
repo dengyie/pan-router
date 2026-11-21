@@ -275,7 +275,7 @@ using System.Reflection;
 [assembly: AssemblyTitle("MangoRouter MangoRouter")]
 [assembly: AssemblyProduct("MangoRouter MangoRouter")]
 [assembly: AssemblyCompany("dengyie")]
-[assembly: AssemblyCopyright("Copyright (C) 2026 dengyie (based on MangoRouter by tidain, AGPL-3.0)")]
+[assembly: AssemblyCopyright("Copyright (C) 2026 dengyie (based on tidain/YunX-Desktop, AGPL-3.0; our brand: MangoRouter)")]
 [assembly: AssemblyDescription("网盘分享链接解析与高速下载器")]
 [assembly: AssemblyVersion("$AppVersion")]
 [assembly: AssemblyFileVersion("$AppVersion")]
