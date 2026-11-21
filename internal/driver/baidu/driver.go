@@ -1,7 +1,7 @@
 // Package baidu 实现百度网盘 driver。
 //
 // 接口形态来自两处实证,不用推测:
-//   - 本仓姊妹项目 YunX-Desktop 的 BaiduApi(生产在用的完整取链链);
+//   - 姊妹桌面端 MangoRouter(仓库 dengyie/PanRouter main 分支)的 BaiduApi(生产在用的完整取链链);
 //   - 上游开源实现的公开调用方式(qjfoidnh/BaiduPCS-Go、AlistGo/alist baidu_share)。
 //
 // 与夸克同型:Cookie 登录态 + 分享链接 + 风控限速。差异在于百度必须经「转存到
