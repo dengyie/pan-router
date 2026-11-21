@@ -455,5 +455,16 @@ func checkCode(code int, msg, what string) error {
 	if code == 401 || strings.Contains(m, "登录") || strings.Contains(m, "token") || strings.Contains(m, "Token") {
 		return driver.NewErr(driver.KindAuthExpired, "123 登录态失效("+m+")", nil)
 	}
+	// 分享不存在/失效类业务码（生产实证:假 key 恒回 5103「此分享不存在」,参数合法时
+	// 稳定复现、无风控）→ KindShareGone:客户端拿到确定性终态,不计入熔断。
+	// 400「ShareKey长度异常」「请输入Next」等是链接解析阶段就该拦下的确定性请求错误,
+	// 归 KindNotFound 而非上游故障——否则一次手滑链接就会把整条 pan 通道打入熔断。
+	if code == 5103 || strings.Contains(m, "分享不存在") || strings.Contains(m, "分享已失效") ||
+		strings.Contains(m, "分享已取消") {
+		return driver.NewErr(driver.KindShareGone, "123 云盘分享已失效("+m+")", nil)
+	}
+	if code == 400 && (strings.Contains(m, "长度异常") || strings.Contains(m, "请输入")) {
+		return driver.NewErr(driver.KindNotFound, "123 分享链接无效("+m+")", nil)
+	}
 	return driver.NewErr(driver.KindUpstream, what+"失败("+m+")", nil)
 }

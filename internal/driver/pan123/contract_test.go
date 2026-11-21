@@ -292,6 +292,53 @@ func TestCheckCredential(t *testing.T) {
 	}
 }
 
+// 生产实证(2026-11-21):参数合法的假 shareKey 上游恒回 code 5103「此分享不存在」,
+// 稳定复现无风控 → 必须映射 KindShareGone(确定性终态),而非 KindUpstream(502+
+// 计入熔断)——否则一次手滑链接就把整条 pan 通道打入 10min 熔断(v2.17 首日事故)。
+func TestShareNotExistMapsShareGone(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, `{"code":5103,"message":"此分享不存在","data":null}`)
+	}))
+	defer srv.Close()
+	d := newTestDriver(t, srv)
+
+	_, err := d.ResolveShare(context.Background(), driver.ShareLink{URL: "https://www.123pan.com/s/aaaaaa-bbbbbb"}, nil)
+	var de *driver.Error
+	if !errors.As(err, &de) || de.Kind != driver.KindShareGone {
+		t.Fatalf("err = %v, want KindShareGone", err)
+	}
+}
+
+// 400「ShareKey长度异常」是确定性请求错误 → KindNotFound,不触发熔断。
+func TestShareBadKeyMapsNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, `{"code":400,"message":"ShareKey长度异常","data":null}`)
+	}))
+	defer srv.Close()
+	d := newTestDriver(t, srv)
+
+	_, err := d.ResolveShare(context.Background(), driver.ShareLink{URL: "https://www.123pan.com/s/xxxx"}, nil)
+	var de *driver.Error
+	if !errors.As(err, &de) || de.Kind != driver.KindNotFound {
+		t.Fatalf("err = %v, want KindNotFound", err)
+	}
+}
+
+// 其余未知业务码保持 KindUpstream（真实上游故障仍走 502+熔断路径）。
+func TestUnknownCodeStaysUpstream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, `{"code":9999,"message":"内部异常","data":null}`)
+	}))
+	defer srv.Close()
+	d := newTestDriver(t, srv)
+
+	_, err := d.ResolveShare(context.Background(), driver.ShareLink{URL: "https://www.123pan.com/s/aaaaaa-bbbbbb"}, nil)
+	var de *driver.Error
+	if !errors.As(err, &de) || de.Kind != driver.KindUpstream {
+		t.Fatalf("err = %v, want KindUpstream", err)
+	}
+}
+
 func TestSignDeterminism(t *testing.T) {
 	// 同 ts 两次签名 auth-key 必须一致（时间部分确定性）,auth-value 因 random 不同而不同
 	ak1, av1 := makeSign("/b/api/share/download/info", 1700000000)
